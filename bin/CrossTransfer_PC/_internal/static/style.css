@@ -1136,3 +1136,68 @@ body {
     background: #f8fafc;
 }
 
+/* Context Menu */
+.context-menu {
+    position: fixed;
+    z-index: 10000;
+    min-width: 190px;
+    background: #ffffff;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15), 0 2px 6px rgba(0, 0, 0, 0.08);
+    padding: 6px 0;
+    font-size: 13px;
+    user-select: none;
+    animation: fadeIn 0.1s ease-out;
+}
+
+.context-menu-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 16px;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-weight: 500;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.context-menu-item:hover {
+    background: #eff6ff;
+    color: var(--primary);
+}
+
+.context-menu-item.context-menu-danger {
+    color: #ef4444;
+}
+
+.context-menu-item.context-menu-danger:hover {
+    background: #fef2f2;
+    color: #dc2626;
+}
+
+.context-menu-item.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.context-menu-divider {
+    height: 1px;
+    background: #f1f5f9;
+    margin: 4px 0;
+}
+
+/* Row selection styles */
+.phone-explorer-row.selected {
+    background: #eff6ff !important;
+    border-color: #93c5fd !important;
+    outline: 2px solid #3b82f6;
+    outline-offset: -2px;
+}
+
+.phone-explorer-row.is-cut {
+    opacity: 0.55;
+    filter: grayscale(0.5);
+    border-style: dashed !important;
+}
+

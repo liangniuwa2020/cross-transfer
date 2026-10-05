@@ -149,9 +149,11 @@
                 <div class="toolbar-left">
                     <button class="btn-sm btn-action" id="btnGoRoot" title="返回手机内部存储根目录">🏠 内部存储</button>
                     <button class="btn-sm btn-action" id="btnGoParent" title="返回上一级目录" disabled>⬅️ 返回上一级</button>
-                    <button class="btn-sm btn-action" id="btnRefreshPhoneStorage" title="重新扫描当前目录">🔄 刷新目录</button>
-                    <button class="btn-sm btn-action btn-highlight" id="btnModalUploadToPhone" title="从电脑选取文件保存到当前手机文件夹">📤 上传文件到此目录</button>
-                    <button class="btn-sm btn-action" id="btnModalUploadFolderToPhone" title="从电脑选取文件夹保存到当前手机文件夹">📁 上传文件夹到此目录</button>
+                    <button class="btn-sm btn-action" id="btnRefreshPhoneStorage" title="重新扫描当前目录">🔄 刷新</button>
+                    <button class="btn-sm btn-action btn-highlight" id="btnModalPaste" title="从电脑剪贴板直接粘贴文件/文件夹到此目录 (快捷键 Ctrl+V)">📋 粘贴电脑文件</button>
+                    <button class="btn-sm btn-action" id="btnModalNewFolder" title="在当前手机目录新建文件夹">➕ 新建文件夹</button>
+                    <button class="btn-sm btn-action" id="btnModalUploadToPhone" title="从电脑选取文件保存到当前手机文件夹">📤 上传文件</button>
+                    <button class="btn-sm btn-action" id="btnModalUploadFolderToPhone" title="从电脑选取文件夹保存到当前手机文件夹">📁 上传文件夹</button>
                     <input type="file" id="modalFolderFileInput" multiple style="display: none;">
                     <input type="file" id="modalFolderDirInput" webkitdirectory directory multiple style="display: none;">
                 </div>
@@ -251,6 +253,21 @@
             <div class="drag-overlay-sub" id="dragOverlaySub">支持任意单文件、多文件拖拽及整个文件夹（可直接发送或打包ZIP）</div>
             <div class="drag-overlay-target" id="dragOverlayTarget" style="display: none;"></div>
         </div>
+    </div>
+
+    <!-- Context Menu for Phone Explorer -->
+    <div id="explorerContextMenu" class="context-menu" style="display: none;">
+        <div class="context-menu-item" id="cmenuOpen">📂 打开 / 进入</div>
+        <div class="context-menu-item" id="cmenuDownload">⬇️ 下载到电脑</div>
+        <div class="context-menu-divider"></div>
+        <div class="context-menu-item" id="cmenuCopy">📋 复制手机文件 (Ctrl+C)</div>
+        <div class="context-menu-item" id="cmenuCut">✂️ 剪切手机文件 (Ctrl+X)</div>
+        <div class="context-menu-item" id="cmenuPaste">📋 粘贴到此目录 (Ctrl+V)</div>
+        <div class="context-menu-divider"></div>
+        <div class="context-menu-item" id="cmenuRename">✏️ 重命名 (F2)</div>
+        <div class="context-menu-item" id="cmenuNewFolder">➕ 新建文件夹</div>
+        <div class="context-menu-divider"></div>
+        <div class="context-menu-item context-menu-danger" id="cmenuDelete">🗑️ 删除 (Delete)</div>
     </div>
 
     <!-- Local JSZip Library -->

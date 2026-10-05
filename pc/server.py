@@ -7,6 +7,7 @@ import base64
 import json
 import uuid
 import subprocess
+import ctypes
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -438,6 +439,225 @@ async def request_storage_permission():
     })
     return {"status": "ok"}
 
+def get_windows_clipboard_files() -> List[str]:
+    """Retrieve list of files/directories currently copied in Windows clipboard (CF_HDROP)."""
+    if sys.platform != "win32":
+        return []
+    CF_HDROP = 15
+    files = []
+    user32 = ctypes.windll.user32
+    shell32 = ctypes.windll.shell32
+    if not user32.OpenClipboard(None):
+        return []
+    try:
+        h_drop = user32.GetClipboardData(CF_HDROP)
+        if not h_drop:
+            return []
+        count = shell32.DragQueryFileW(h_drop, 0xFFFFFFFF, None, 0)
+        buf = ctypes.create_unicode_buffer(1024)
+        for i in range(count):
+            length = shell32.DragQueryFileW(h_drop, i, buf, 1024)
+            if length > 0:
+                files.append(buf.value)
+    except Exception as e:
+        print(f"Clipboard read error: {e}")
+    finally:
+        user32.CloseClipboard()
+    return files
+
+@app.get("/api/clipboard_files")
+def get_clipboard_items():
+    """Get list of files currently in Windows clipboard."""
+    files = get_windows_clipboard_files()
+    items = []
+    for fp in files:
+        p = Path(fp)
+        if p.exists():
+            items.append({
+                "name": p.name,
+                "path": str(p.resolve()),
+                "is_dir": p.is_dir(),
+                "size": p.stat().st_size if p.is_file() else 0
+            })
+    return {"status": "ok", "files": items}
+
+@app.post("/api/paste_clipboard")
+async def paste_clipboard(payload: dict = None):
+    """Pushes all files/folders in Windows clipboard to the phone."""
+    if not connected_androids:
+        raise HTTPException(status_code=400, detail="未连接任何安卓设备，请先用手机扫码！")
+    
+    target_dir = payload.get("target_dir", "") if payload else ""
+    files = get_windows_clipboard_files()
+    if not files:
+        return {"status": "empty", "message": "电脑剪贴板中没有复制的文件或文件夹"}
+    
+    transferred = []
+    for fp in files:
+        p = Path(fp)
+        if not p.exists():
+            continue
+        if p.is_file():
+            file_id = str(uuid.uuid4())
+            clean_name = p.name
+            file_size = p.stat().st_size
+            staged_files[file_id] = {
+                "path": p,
+                "name": clean_name,
+                "size": file_size,
+                "target_dir": target_dir
+            }
+            item = {
+                "id": file_id,
+                "name": clean_name,
+                "size": file_size,
+                "path": str(p.resolve()),
+                "time": time.time(),
+                "direction": "outgoing",
+                "source": "Windows 剪贴板粘贴"
+            }
+            transfer_history.insert(0, item)
+            await notify_android_clients({
+                "action": "send_file_to_phone",
+                "id": file_id,
+                "name": clean_name,
+                "size": file_size,
+                "target_dir": target_dir
+            })
+            await broadcast_to_browsers({
+                "type": "file_sent",
+                "file": item
+            })
+            transferred.append(clean_name)
+        elif p.is_dir():
+            folder_name = p.name
+            root_parent = p.parent
+            walked_any = False
+            for root, dirs, files_in_dir in os.walk(str(p)):
+                walked_any = True
+                rel_root = os.path.relpath(root, str(root_parent)).replace("\\", "/")
+                curr_target = f"{target_dir}/{rel_root}" if target_dir else rel_root
+                await notify_android_clients({
+                    "action": "create_directory",
+                    "path": curr_target
+                })
+                for fn in files_in_dir:
+                    fpath = Path(root) / fn
+                    fid = str(uuid.uuid4())
+                    fsize = fpath.stat().st_size
+                    staged_files[fid] = {
+                        "path": fpath,
+                        "name": fn,
+                        "size": fsize,
+                        "target_dir": curr_target
+                    }
+                    item = {
+                        "id": fid,
+                        "name": fn,
+                        "size": fsize,
+                        "path": str(fpath.resolve()),
+                        "time": time.time(),
+                        "direction": "outgoing",
+                        "source": f"Windows 文件夹传输 ({folder_name})"
+                    }
+                    transfer_history.insert(0, item)
+                    await notify_android_clients({
+                        "action": "send_file_to_phone",
+                        "id": fid,
+                        "name": fn,
+                        "size": fsize,
+                        "target_dir": curr_target
+                    })
+                    await broadcast_to_browsers({
+                        "type": "file_sent",
+                        "file": item
+                    })
+            if not walked_any:
+                empty_target = f"{target_dir}/{folder_name}" if target_dir else folder_name
+                await notify_android_clients({
+                    "action": "create_directory",
+                    "path": empty_target
+                })
+            transferred.append(folder_name)
+    
+    return {"status": "ok", "transferred": transferred}
+
+@app.post("/api/create_phone_dir")
+async def create_phone_dir(payload: dict):
+    """Remotely create directory on phone."""
+    if not connected_androids:
+        raise HTTPException(status_code=400, detail="未连接任何安卓设备")
+    path = payload.get("path")
+    if not path:
+        raise HTTPException(status_code=400, detail="缺少目录路径")
+    await notify_android_clients({
+        "action": "create_directory",
+        "path": path
+    })
+    return {"status": "ok"}
+
+@app.post("/api/delete_phone_file")
+async def delete_phone_file(payload: dict):
+    """Remotely delete file or directory on phone."""
+    if not connected_androids:
+        raise HTTPException(status_code=400, detail="未连接任何安卓设备")
+    path = payload.get("path")
+    if not path:
+        raise HTTPException(status_code=400, detail="缺少文件或目录路径")
+    await notify_android_clients({
+        "action": "delete_file",
+        "path": path
+    })
+    return {"status": "ok"}
+
+@app.post("/api/rename_phone_file")
+async def rename_phone_file(payload: dict):
+    """Remotely rename file or directory on phone."""
+    if not connected_androids:
+        raise HTTPException(status_code=400, detail="未连接任何安卓设备")
+    path = payload.get("path")
+    new_name = payload.get("new_name")
+    if not path or not new_name:
+        raise HTTPException(status_code=400, detail="缺少路径或新文件名")
+    await notify_android_clients({
+        "action": "rename_file",
+        "path": path,
+        "new_name": new_name
+    })
+    return {"status": "ok"}
+
+@app.post("/api/copy_phone_file")
+async def copy_phone_file(payload: dict):
+    """Remotely copy file or directory on phone."""
+    if not connected_androids:
+        raise HTTPException(status_code=400, detail="未连接任何安卓设备")
+    source_path = payload.get("source_path")
+    target_dir = payload.get("target_dir")
+    if not source_path or not target_dir:
+        raise HTTPException(status_code=400, detail="缺少源路径或目标目录")
+    await notify_android_clients({
+        "action": "copy_file",
+        "source_path": source_path,
+        "target_dir": target_dir
+    })
+    return {"status": "ok"}
+
+@app.post("/api/move_phone_file")
+async def move_phone_file(payload: dict):
+    """Remotely move/cut file or directory on phone."""
+    if not connected_androids:
+        raise HTTPException(status_code=400, detail="未连接任何安卓设备")
+    source_path = payload.get("source_path")
+    target_dir = payload.get("target_dir")
+    if not source_path or not target_dir:
+        raise HTTPException(status_code=400, detail="缺少源路径或目标目录")
+    await notify_android_clients({
+        "action": "move_file",
+        "source_path": source_path,
+        "target_dir": target_dir
+    })
+    return {"status": "ok"}
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -497,6 +717,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         "root_path": msg.get("root_path", ""),
                         "has_permission": msg.get("has_permission", True),
                         "items": msg.get("items", [])
+                    })
+                elif action == "operation_result":
+                    await broadcast_to_browsers({
+                        "type": "operation_result",
+                        "operation": msg.get("operation"),
+                        "success": msg.get("success"),
+                        "message": msg.get("message"),
+                        "refresh_path": msg.get("refresh_path")
                     })
             except Exception:
                 pass

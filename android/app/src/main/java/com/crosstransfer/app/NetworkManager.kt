@@ -111,6 +111,29 @@ class NetworkManager(private val context: Context) {
                                 uploadPath(path)
                             }
                         }
+                        "create_directory" -> {
+                            val path = json.optString("path")
+                            handleCreateDirectory(path)
+                        }
+                        "delete_file" -> {
+                            val path = json.optString("path")
+                            handleDeleteFile(path)
+                        }
+                        "rename_file" -> {
+                            val path = json.optString("path")
+                            val newName = json.optString("new_name")
+                            handleRenameFile(path, newName)
+                        }
+                        "copy_file" -> {
+                            val sourcePath = json.optString("source_path")
+                            val targetDir = json.optString("target_dir")
+                            handleCopyFile(sourcePath, targetDir)
+                        }
+                        "move_file" -> {
+                            val sourcePath = json.optString("source_path")
+                            val targetDir = json.optString("target_dir")
+                            handleMoveFile(sourcePath, targetDir)
+                        }
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -294,6 +317,118 @@ class NetworkManager(private val context: Context) {
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
+            }
+        }.start()
+    }
+
+    private fun sendOperationResult(op: String, success: Boolean, message: String, refreshPath: String? = null) {
+        Thread {
+            try {
+                val resp = JSONObject()
+                resp.put("action", "operation_result")
+                resp.put("operation", op)
+                resp.put("success", success)
+                resp.put("message", message)
+                resp.put("refresh_path", refreshPath ?: "")
+                webSocket?.send(resp.toString())
+                if (!refreshPath.isNullOrBlank()) {
+                    listDirectory(refreshPath)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }.start()
+    }
+
+    private fun handleCreateDirectory(path: String) {
+        Thread {
+            try {
+                val dir = File(path)
+                val success = dir.exists() || dir.mkdirs()
+                sendOperationResult("create_directory", success, if (success) "文件夹创建成功" else "创建文件夹失败", dir.parent ?: path)
+            } catch (e: Exception) {
+                sendOperationResult("create_directory", false, e.localizedMessage ?: "创建失败", null)
+            }
+        }.start()
+    }
+
+    private fun handleDeleteFile(path: String) {
+        Thread {
+            try {
+                val file = File(path)
+                val parent = file.parent ?: "/storage/emulated/0"
+                val success = if (file.exists()) {
+                    if (file.isDirectory) file.deleteRecursively() else file.delete()
+                } else false
+                sendOperationResult("delete", success, if (success) "删除成功" else "文件不存在或无权删除", parent)
+            } catch (e: Exception) {
+                sendOperationResult("delete", false, e.localizedMessage ?: "删除失败", null)
+            }
+        }.start()
+    }
+
+    private fun handleRenameFile(path: String, newName: String) {
+        Thread {
+            try {
+                val oldFile = File(path)
+                val newFile = File(oldFile.parentFile, newName)
+                val success = oldFile.exists() && oldFile.renameTo(newFile)
+                sendOperationResult("rename", success, if (success) "重命名成功" else "重命名失败，新名称可能冲突", oldFile.parent ?: "/storage/emulated/0")
+            } catch (e: Exception) {
+                sendOperationResult("rename", false, e.localizedMessage ?: "重命名失败", null)
+            }
+        }.start()
+    }
+
+    private fun handleCopyFile(sourcePath: String, targetDir: String) {
+        Thread {
+            try {
+                val source = File(sourcePath)
+                val destDir = File(targetDir)
+                if (!destDir.exists()) destDir.mkdirs()
+                val dest = File(destDir, source.name)
+                val success = try {
+                    if (source.isDirectory) {
+                        source.copyRecursively(dest, overwrite = true)
+                    } else {
+                        source.copyTo(dest, overwrite = true)
+                    }
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+                sendOperationResult("copy", success, if (success) "复制成功" else "复制失败", targetDir)
+            } catch (e: Exception) {
+                sendOperationResult("copy", false, e.localizedMessage ?: "复制失败", targetDir)
+            }
+        }.start()
+    }
+
+    private fun handleMoveFile(sourcePath: String, targetDir: String) {
+        Thread {
+            try {
+                val source = File(sourcePath)
+                val destDir = File(targetDir)
+                if (!destDir.exists()) destDir.mkdirs()
+                val dest = File(destDir, source.name)
+                var success = source.renameTo(dest)
+                if (!success) {
+                    try {
+                        if (source.isDirectory) {
+                            source.copyRecursively(dest, overwrite = true)
+                            source.deleteRecursively()
+                        } else {
+                            source.copyTo(dest, overwrite = true)
+                            source.delete()
+                        }
+                        success = true
+                    } catch (e: Exception) {
+                        success = false
+                    }
+                }
+                sendOperationResult("move", success, if (success) "移动成功" else "移动失败", targetDir)
+            } catch (e: Exception) {
+                sendOperationResult("move", false, e.localizedMessage ?: "移动失败", targetDir)
             }
         }.start()
     }
@@ -582,7 +717,9 @@ class NetworkManager(private val context: Context) {
                 mainHandler.post {
                     listener?.onFileTransferCompleted(item)
                 }
-
+                if (!targetDirPath.isNullOrBlank()) {
+                    listDirectory(targetDirPath)
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
                 mainHandler.post {
