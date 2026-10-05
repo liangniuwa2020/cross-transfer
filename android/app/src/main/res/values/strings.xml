@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">跨屏快传 (CrossTransfer)</string>
+    <string name="scan_pc_qr">扫码连接电脑</string>
+    <string name="pc_not_connected">未连接电脑</string>
+    <string name="pc_connected">已连接电脑</string>
+    <string name="send_files">发送文件 / 压缩包</string>
+    <string name="send_photos">发送相册照片 / 视频</string>
+    <string name="received_files">接收到的文件</string>
+    <string name="clear_list">清空记录</string>
+</resources>

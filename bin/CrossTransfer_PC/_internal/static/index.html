@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>跨屏快传 - Windows 桌面端</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <div class="logo-icon">⚡</div>
+                <div>
+                    <h1>跨屏快传 <span>CrossTransfer PC</span> <span class="badge-ver">v1.3.0 桌面端</span></h1>
+                    <p class="subtitle">局域网极速穿透 • Android 与 Windows 双向文件互传 • 支持文件夹拖拽与打包</p>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="network-badge">
+                    <span class="dot live"></span>
+                    <span id="txtStatus">服务已就绪</span>
+                </div>
+                <div class="ip-selector-wrap">
+                    <label for="selectIp">网卡IP:</label>
+                    <select id="selectIp"></select>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left: QR Code Pairing & Connection Status -->
+            <section class="card qr-section">
+                <div class="card-header">
+                    <h2>📷 手机扫码互联</h2>
+                    <span class="badge" id="phoneStatusBadge">等待连接</span>
+                </div>
+                <div class="qr-container">
+                    <div class="qr-box" id="qrBox">
+                        <img id="imgQr" src="" alt="连接二维码加载中...">
+                        <div class="qr-overlay" id="qrOverlay">
+                            <span class="spinner"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="qr-instructions">
+                    <p>1. 打开安卓手机上的 <strong>跨屏快传</strong> APP</p>
+                    <p>2. 点击右上角 <strong>【📷 扫码互联】</strong> 扫描此二维码</p>
+                    <p class="ip-hint">电脑连接地址: <code id="txtCurrentUrl">加载中...</code> <button class="btn-sm" id="btnCopyUrl">复制</button></p>
+                </div>
+
+                <div class="device-card" id="deviceCard">
+                    <div class="device-top">
+                        <div class="device-icon">📱</div>
+                        <div class="device-info">
+                            <div class="device-name" id="txtDeviceName">尚未连接手机</div>
+                            <div class="device-desc" id="txtDeviceDesc">请在手机端完成扫码</div>
+                        </div>
+                        <div class="status-indicator" id="statusIndicator"></div>
+                    </div>
+                    <!-- Actions shown when connected -->
+                    <div class="device-actions" id="deviceActions" style="display: none;">
+                        <button class="btn-storage" id="btnEnterStorage">📂 进入手机存储</button>
+                        <button class="btn-disconnect" id="btnDisconnect">🔌 断开连接</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right: File Transfer & History -->
+            <section class="card transfer-section">
+                <div class="card-header">
+                    <h2>📤 发送文件/文件夹给手机</h2>
+                    <button class="btn-secondary" id="btnOpenFolder">📂 打开下载文件夹</button>
+                </div>
+
+                <!-- Dropzone -->
+                <div class="dropzone" id="dropzone">
+                    <input type="file" id="filePicker" multiple style="display: none;">
+                    <input type="file" id="folderPicker" webkitdirectory directory multiple style="display: none;">
+                    <div class="dropzone-content">
+                        <div class="drop-icon">📁</div>
+                        <p class="drop-text">拖拽文件或整个文件夹到此处（或窗口任意位置）</p>
+                        <div class="drop-buttons">
+                            <button class="btn-primary" id="btnBrowseFiles">📄 选择电脑文件</button>
+                            <button class="btn-secondary" id="btnBrowseFolder">📂 选择电脑文件夹</button>
+                        </div>
+                        <p class="drop-hint">全面支持单文件、多文件批量拖拽、以及整个文件夹（可直接发送或自动打包ZIP）</p>
+                    </div>
+                </div>
+
+                <!-- Live Transfer Progress -->
+                <div class="progress-card" id="progressCard" style="display: none;">
+                    <div class="progress-header">
+                        <span class="progress-title" id="txtProgressTitle">正在发送: filename.zip</span>
+                        <span class="progress-percent" id="txtProgressPercent">0%</span>
+                    </div>
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+                    </div>
+                    <div class="progress-footer">
+                        <span id="txtProgressSpeed">0 MB/s</span>
+                        <span id="txtProgressDetails">0 MB / 0 MB</span>
+                    </div>
+                </div>
+
+                <!-- File History -->
+                <div class="history-section">
+                    <div class="history-header">
+                        <h3>互传历史记录</h3>
+                        <span class="history-count" id="txtHistoryCount">共 0 个文件</span>
+                    </div>
+                    <div class="history-list" id="historyList">
+                        <div class="empty-hint" id="emptyHint">
+                            暂无传输记录，连接后拖入文件或文件夹即可瞬间送达手机
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Phone Storage & Directory Explorer Modal -->
+    <div class="modal-overlay" id="phoneStorageModal" style="display: none;">
+        <div class="modal-dialog modal-explorer-dialog">
+            <div class="modal-header">
+                <div class="modal-title-wrap">
+                    <span class="modal-icon">📱</span>
+                    <div>
+                        <h3 id="txtModalDeviceTitle">手机文件夹与存储管理</h3>
+                        <p class="modal-subtitle">双向极速互联 • 可点击进入任意文件夹、下载文件或直接拖拽文件/文件夹存入当前手机目录</p>
+                    </div>
+                </div>
+                <button class="modal-close" id="btnCloseModal">✕</button>
+            </div>
+
+            <!-- Permission Alert Banner -->
+            <div class="permission-alert-banner" id="permissionAlertBanner" style="display: none;">
+                <div class="banner-text">
+                    <span class="banner-icon">🛡️</span>
+                    <span>提示：若手机部分系统文件夹无法访问，请在手机端开启【所有文件管理权限】。</span>
+                </div>
+                <button class="btn-sm btn-warning" id="btnRequestPermission">在手机端弹出授权</button>
+            </div>
+
+            <!-- Toolbar & Actions -->
+            <div class="modal-toolbar">
+                <div class="toolbar-left">
+                    <button class="btn-sm btn-action" id="btnGoRoot" title="返回手机内部存储根目录">🏠 内部存储</button>
+                    <button class="btn-sm btn-action" id="btnGoParent" title="返回上一级目录" disabled>⬅️ 返回上一级</button>
+                    <button class="btn-sm btn-action" id="btnRefreshPhoneStorage" title="重新扫描当前目录">🔄 刷新目录</button>
+                    <button class="btn-sm btn-action btn-highlight" id="btnModalUploadToPhone" title="从电脑选取文件保存到当前手机文件夹">📤 上传文件到此目录</button>
+                    <button class="btn-sm btn-action" id="btnModalUploadFolderToPhone" title="从电脑选取文件夹保存到当前手机文件夹">📁 上传文件夹到此目录</button>
+                    <input type="file" id="modalFolderFileInput" multiple style="display: none;">
+                    <input type="file" id="modalFolderDirInput" webkitdirectory directory multiple style="display: none;">
+                </div>
+                <div class="toolbar-right">
+                    <button class="btn-sm btn-action" id="btnTriggerRemotePicker" title="在手机屏幕上展开系统全能选择器">📲 手机端选择器</button>
+                    <button class="btn-sm btn-danger" id="btnModalDisconnect">🔌 断开连接</button>
+                </div>
+            </div>
+
+            <!-- Path Bar & Shortcuts -->
+            <div class="path-navigation-bar">
+                <div class="current-path-wrap">
+                    <span class="path-label">📂 当前目录:</span>
+                    <span class="path-val" id="txtCurrentPath">/storage/emulated/0</span>
+                </div>
+                <div class="quick-shortcuts">
+                    <span class="shortcut-label">常用目录:</span>
+                    <button class="shortcut-chip" data-folder="Download">📥 下载 (Download)</button>
+                    <button class="shortcut-chip" data-folder="DCIM">📷 相册 (DCIM)</button>
+                    <button class="shortcut-chip" data-folder="Pictures">🖼️ 图片 (Pictures)</button>
+                    <button class="shortcut-chip" data-folder="Documents">📄 文档 (Documents)</button>
+                    <button class="shortcut-chip" data-folder="Music">🎵 音乐 (Music)</button>
+                    <button class="shortcut-chip" data-folder="Movies">🎬 视频 (Movies)</button>
+                </div>
+            </div>
+
+            <!-- Directory Content Table -->
+            <div class="modal-body modal-explorer-body">
+                <div class="explorer-table-header">
+                    <div class="col-name">名称</div>
+                    <div class="col-size">大小 / 子项</div>
+                    <div class="col-time">修改时间</div>
+                    <div class="col-action">操作</div>
+                </div>
+                <div class="phone-file-list" id="phoneFileList">
+                    <div class="loading-hint" id="phoneStorageLoading">正在读取手机存储目录结构...</div>
+                </div>
+            </div>
+
+            <div class="modal-footer">
+                <div class="footer-stats">
+                    <span id="txtPhoneStorageStats">正在加载...</span>
+                    <span class="current-upload-target" id="txtUploadTargetHint"></span>
+                </div>
+                <button class="btn-secondary" id="btnDismissModal">完成</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Folder Upload Choice Modal -->
+    <div class="modal-overlay" id="folderChoiceModal" style="display: none;">
+        <div class="modal-dialog modal-choice-dialog">
+            <div class="modal-header">
+                <div class="modal-title-wrap">
+                    <span class="modal-icon">📦</span>
+                    <div>
+                        <h3 id="txtFolderChoiceTitle">传输文件夹到手机</h3>
+                        <p class="modal-subtitle" id="txtFolderChoiceSubtitle">检测到文件夹，请选择传输方式</p>
+                    </div>
+                </div>
+                <button class="modal-close" id="btnCloseFolderChoiceModal">✕</button>
+            </div>
+            <div class="modal-body modal-choice-body">
+                <div class="folder-info-card">
+                    <div class="folder-info-icon">📁</div>
+                    <div class="folder-info-details">
+                        <div class="folder-info-name" id="txtFolderInfoName">文件夹名称</div>
+                        <div class="folder-info-stats" id="txtFolderInfoStats">包含 0 个文件 • 0 B</div>
+                    </div>
+                </div>
+                <div class="folder-options-grid">
+                    <div class="folder-option-card active" id="optZip">
+                        <div class="opt-badge">推荐</div>
+                        <div class="opt-icon">📦</div>
+                        <div class="opt-title">打包为压缩包发送 (.zip)</div>
+                        <div class="opt-desc">自动将文件夹无损打包成单个 ZIP 压缩包高速传输，手机端接收后可直接打开或解压。</div>
+                    </div>
+                    <div class="folder-option-card" id="optDirect">
+                        <div class="opt-icon">📂</div>
+                        <div class="opt-title">保持文件夹结构传输</div>
+                        <div class="opt-desc">在手机端创建同名文件夹，将文件夹内的每个文件原样存入对应手机目录中。</div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer modal-choice-footer">
+                <button class="btn-secondary" id="btnCancelFolderChoice">取消</button>
+                <button class="btn-primary" id="btnConfirmFolderChoice">立即传输</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Global Full-Window Drag & Drop Overlay -->
+    <div class="global-drag-overlay" id="globalDragOverlay" style="display: none;">
+        <div class="drag-overlay-box">
+            <div class="drag-overlay-icon">🚀</div>
+            <div class="drag-overlay-title" id="dragOverlayTitle">释放文件或文件夹，立即传输到手机</div>
+            <div class="drag-overlay-sub" id="dragOverlaySub">支持任意单文件、多文件拖拽及整个文件夹（可直接发送或打包ZIP）</div>
+            <div class="drag-overlay-target" id="dragOverlayTarget" style="display: none;"></div>
+        </div>
+    </div>
+
+    <!-- Local JSZip Library -->
+    <script src="jszip.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

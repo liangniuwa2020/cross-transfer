@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec.bak
+
+# PyInstaller build files
+pc/build/
+pc/dist/
+
+# Android build outputs & cache
+android/.gradle/
+android/local.properties
+android/app/build/
+android/.idea/
+android/*.iml
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
