@@ -46,7 +46,15 @@ def run_server():
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="warning",
+        timeout_keep_alive=3600,
+        ws_ping_interval=15.0,
+        ws_ping_timeout=30.0
+    )
 
 def main():
     print("=" * 60)

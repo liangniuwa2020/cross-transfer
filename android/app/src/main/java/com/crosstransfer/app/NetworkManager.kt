@@ -34,9 +34,11 @@ class NetworkManager(private val context: Context) {
     }
 
     private var client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS) // infinite for websockets & big downloads
         .writeTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(10, TimeUnit.SECONDS) // OkHttp native WebSocket PING frame every 10s to keep NAT/AP alive
+        .retryOnConnectionFailure(true)
         .build()
 
     private var webSocket: WebSocket? = null
@@ -47,13 +49,35 @@ class NetworkManager(private val context: Context) {
     var isConnected: Boolean = false
         private set
 
+    private var autoReconnectEnabled = false
+    private var reconnectAttempts = 0
+    private var lastPin: String = ""
+
     var listener: ConnectionListener? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private val appPingRunnable = object : Runnable {
+        override fun run() {
+            if (isConnected && webSocket != null) {
+                try {
+                    webSocket?.send("ping")
+                } catch (_: Exception) {}
+                mainHandler.postDelayed(this, 15000)
+            }
+        }
+    }
+
     fun connect(host: String, port: Int, pin: String = "") {
-        disconnect("正在重新连接...")
+        autoReconnectEnabled = true
+        reconnectAttempts = 0
+        lastPin = pin
         serverHost = host
         serverPort = port
+        internalConnect(host, port, pin)
+    }
+
+    private fun internalConnect(host: String, port: Int, pin: String) {
+        closeWebSocketInternal()
 
         val wsUrl = "ws://$host:$port/ws?device=android&model=${android.os.Build.MODEL}&pin=$pin"
         val request = Request.Builder().url(wsUrl).build()
@@ -61,6 +85,9 @@ class NetworkManager(private val context: Context) {
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 isConnected = true
+                reconnectAttempts = 0
+                mainHandler.removeCallbacks(appPingRunnable)
+                mainHandler.post(appPingRunnable)
                 mainHandler.post {
                     listener?.onConnected("Windows PC", host, port)
                 }
@@ -146,40 +173,70 @@ class NetworkManager(private val context: Context) {
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 isConnected = false
-                mainHandler.post {
-                    listener?.onDisconnected(reason.ifEmpty { "连接已关闭" })
+                mainHandler.removeCallbacks(appPingRunnable)
+                if (autoReconnectEnabled && code != 1000) {
+                    scheduleReconnect("网络连接关闭，正在尝试重连...")
+                } else {
+                    mainHandler.post {
+                        listener?.onDisconnected(reason.ifEmpty { "连接已关闭" })
+                    }
                 }
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 isConnected = false
-                mainHandler.post {
-                    listener?.onDisconnected("连接失败: ${t.localizedMessage ?: "无法连接到电脑"}")
+                mainHandler.removeCallbacks(appPingRunnable)
+                if (autoReconnectEnabled) {
+                    scheduleReconnect("连接中断，正在自动恢复...")
+                } else {
+                    mainHandler.post {
+                        listener?.onDisconnected("连接失败: ${t.localizedMessage ?: "无法连接到电脑"}")
+                    }
                 }
             }
         })
     }
 
-    fun disconnect(reason: String = "用户断开") {
+    private fun scheduleReconnect(notice: String) {
+        if (!autoReconnectEnabled || serverHost.isEmpty()) return
+        reconnectAttempts++
+        val delayMs = if (reconnectAttempts <= 3) 2000L else if (reconnectAttempts <= 10) 4000L else 8000L
+        mainHandler.post {
+            listener?.onDisconnected("$notice (第${reconnectAttempts}次重试)")
+        }
+        mainHandler.postDelayed({
+            if (autoReconnectEnabled && !isConnected && serverHost.isNotEmpty()) {
+                internalConnect(serverHost, serverPort, lastPin)
+            }
+        }, delayMs)
+    }
+
+    private fun closeWebSocketInternal() {
+        mainHandler.removeCallbacks(appPingRunnable)
         try {
-            webSocket?.close(1000, reason)
+            webSocket?.close(1000, null)
         } catch (_: Exception) {}
         webSocket = null
         isConnected = false
+    }
+
+    fun disconnect(reason: String = "用户断开") {
+        autoReconnectEnabled = false
+        closeWebSocketInternal()
         mainHandler.post {
             listener?.onDisconnected(reason)
         }
     }
 
     fun disconnectByUser() {
+        autoReconnectEnabled = false
         try {
             val json = JSONObject()
             json.put("action", "phone_disconnect")
             webSocket?.send(json.toString())
             webSocket?.close(1000, "手机主动断开")
         } catch (_: Exception) {}
-        webSocket = null
-        isConnected = false
+        closeWebSocketInternal()
         mainHandler.post {
             listener?.onDisconnected("已主动断开连接")
         }

@@ -59,6 +59,20 @@ const btnTriggerRemotePicker = document.getElementById('btnTriggerRemotePicker')
 const modalFolderFileInput = document.getElementById('modalFolderFileInput');
 const modalFolderDirInput = document.getElementById('modalFolderDirInput');
 const txtUploadTargetHint = document.getElementById('txtUploadTargetHint');
+const btnModalPaste = document.getElementById('btnModalPaste');
+const btnModalNewFolder = document.getElementById('btnModalNewFolder');
+const explorerContextMenu = document.getElementById('explorerContextMenu');
+const cmenuOpen = document.getElementById('cmenuOpen');
+const cmenuDownload = document.getElementById('cmenuDownload');
+const cmenuCopy = document.getElementById('cmenuCopy');
+const cmenuCut = document.getElementById('cmenuCut');
+const cmenuPaste = document.getElementById('cmenuPaste');
+const cmenuRename = document.getElementById('cmenuRename');
+const cmenuNewFolder = document.getElementById('cmenuNewFolder');
+const cmenuDelete = document.getElementById('cmenuDelete');
+
+let selectedPhoneItem = null;
+let phoneClipboard = null; // { action: 'copy'|'move', path, name, is_dir }
 
 // Modal Elements - Folder Upload Choice
 const folderChoiceModal = document.getElementById('folderChoiceModal');
@@ -129,8 +143,24 @@ function escapeHtml(str) {
     return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function showNotification(msg) {
+function showNotification(msg, duration = 3000) {
     console.log(msg);
+    let container = document.getElementById('toastContainer');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toastContainer';
+        container.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:99999;display:flex;flex-direction:column;gap:10px;pointer-events:none;';
+        document.body.appendChild(container);
+    }
+    const toast = document.createElement('div');
+    toast.style.cssText = 'background:#1e293b;color:#f8fafc;padding:12px 20px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.2);display:flex;align-items:center;gap:8px;pointer-events:auto;transition:all 0.3s ease;border:1px solid #334155;';
+    toast.textContent = msg;
+    container.appendChild(toast);
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(10px)';
+        setTimeout(() => toast.remove(), 300);
+    }, duration);
 }
 
 // Fetch Server Status and QR code
@@ -278,6 +308,168 @@ window.enterPhoneFolder = function(encodedPath) {
     requestPhoneDirectory(path);
 };
 
+function selectItem(item, rowElement) {
+    selectedPhoneItem = item;
+    document.querySelectorAll('.phone-explorer-row').forEach(r => r.classList.remove('selected'));
+    if (rowElement) {
+        rowElement.classList.add('selected');
+    }
+}
+
+function clearSelection() {
+    selectedPhoneItem = null;
+    document.querySelectorAll('.phone-explorer-row').forEach(r => r.classList.remove('selected'));
+}
+
+function hideContextMenu() {
+    if (explorerContextMenu) {
+        explorerContextMenu.style.display = 'none';
+    }
+}
+
+function showContextMenu(x, y, item) {
+    if (!explorerContextMenu) return;
+    const menuWidth = 200;
+    const menuHeight = 260;
+    const posX = (x + menuWidth > window.innerWidth) ? (window.innerWidth - menuWidth - 10) : x;
+    const posY = (y + menuHeight > window.innerHeight) ? (window.innerHeight - menuHeight - 10) : y;
+    explorerContextMenu.style.left = `${posX}px`;
+    explorerContextMenu.style.top = `${posY}px`;
+    explorerContextMenu.style.display = 'block';
+
+    if (item) {
+        cmenuOpen.style.display = 'flex';
+        cmenuOpen.textContent = item.is_dir ? "📂 进入文件夹" : "⬇️ 下载到电脑";
+        cmenuDownload.style.display = item.is_dir ? 'none' : 'flex';
+        cmenuCopy.classList.remove('disabled');
+        cmenuCut.classList.remove('disabled');
+        cmenuRename.classList.remove('disabled');
+        cmenuDelete.classList.remove('disabled');
+    } else {
+        cmenuOpen.style.display = 'none';
+        cmenuDownload.style.display = 'none';
+        cmenuCopy.classList.add('disabled');
+        cmenuCut.classList.add('disabled');
+        cmenuRename.classList.add('disabled');
+        cmenuDelete.classList.add('disabled');
+    }
+}
+
+async function createPhoneDirectoryRemote(path) {
+    try {
+        const res = await fetch('/api/create_phone_dir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: path })
+        });
+        return await res.json();
+    } catch (e) {
+        console.error("创建目录失败:", e);
+    }
+}
+
+async function deletePhoneFileRemote(path, isDir) {
+    const itemType = isDir ? "文件夹及其中所有内容" : "文件";
+    const name = path.split('/').filter(Boolean).pop();
+    if (!confirm(`确定要从手机中彻底删除此${itemType}【${name}】吗？`)) return;
+    try {
+        const res = await fetch('/api/delete_phone_file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: path })
+        });
+        const data = await res.json();
+        if (data.status === 'ok') {
+            showNotification(`已发送删除请求: ${name}`);
+        }
+    } catch (e) {
+        alert("删除请求失败: " + e);
+    }
+}
+
+async function renamePhoneFileRemote(path, currentName) {
+    const newName = prompt(`请输入新的名称:`, currentName);
+    if (!newName || newName.trim() === '' || newName.trim() === currentName) return;
+    try {
+        const res = await fetch('/api/rename_phone_file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: path, new_name: newName.trim() })
+        });
+        const data = await res.json();
+        if (data.status === 'ok') {
+            showNotification(`已发送重命名请求: ${newName.trim()}`);
+        }
+    } catch (e) {
+        alert("重命名失败: " + e);
+    }
+}
+
+function createNewFolderPrompt() {
+    const name = prompt("请输入新建文件夹名称:", "新建文件夹");
+    if (!name || name.trim() === '') return;
+    const targetPath = `${currentDirectoryPath}/${name.trim()}`;
+    createPhoneDirectoryRemote(targetPath);
+    showNotification(`已发送新建文件夹请求: ${name.trim()}`);
+}
+
+async function executePasteAction(targetDir) {
+    targetDir = targetDir || currentDirectoryPath;
+
+    // 1. If phoneClipboard has a phone item
+    if (phoneClipboard && phoneClipboard.path) {
+        const isCut = phoneClipboard.action === 'move';
+        const url = isCut ? '/api/move_phone_file' : '/api/copy_phone_file';
+        try {
+            showNotification(`正在${isCut ? '移动' : '复制'}手机项目: ${phoneClipboard.name} ...`);
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    source_path: phoneClipboard.path,
+                    target_dir: targetDir
+                })
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                if (isCut) {
+                    phoneClipboard = null;
+                }
+            }
+            return;
+        } catch (e) {
+            alert("手机文件操作失败: " + e);
+            return;
+        }
+    }
+
+    // 2. Otherwise paste from Windows PC clipboard
+    try {
+        showNotification("正在读取电脑剪贴板并粘贴到手机当前目录...");
+        const res = await fetch('/api/paste_clipboard', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target_dir: targetDir })
+        });
+        const data = await res.json();
+        if (data.status === 'ok') {
+            const count = data.transferred ? data.transferred.length : 0;
+            if (count > 0) {
+                showNotification(`📋 成功从电脑剪贴板粘贴 ${count} 个项目到手机！`);
+                setTimeout(() => requestPhoneDirectory(currentDirectoryPath), 800);
+            } else {
+                showNotification("电脑剪贴板中未找到复制的文件或文件夹");
+            }
+        } else if (data.status === 'empty') {
+            showNotification("⚠️ 电脑剪贴板为空，请先在电脑上复制(Ctrl+C)文件或文件夹！");
+        } else {
+            alert(data.message || data.detail || "粘贴失败");
+        }
+    } catch (e) {
+        alert("粘贴电脑剪贴板失败: " + e);
+    }
+}
+
 // Render directory content
 function renderDirectoryContent(data) {
     isDirectoryLoading = false;
@@ -287,6 +479,7 @@ function renderDirectoryContent(data) {
     currentParentPath = data.parent_path || null;
     currentRootPath = data.root_path || "/storage/emulated/0";
     hasStoragePermission = data.has_permission !== false;
+    selectedPhoneItem = null;
 
     // Update path display
     txtCurrentPath.textContent = currentDirectoryPath;
@@ -312,7 +505,7 @@ function renderDirectoryContent(data) {
             <div class="loading-hint">
                 <div style="font-size: 36px; margin-bottom: 8px;">📂</div>
                 <div style="font-weight: 600; color: #334155; font-size: 14px;">此文件夹暂无文件</div>
-                <div style="font-size: 12px; color: #94a3b8; margin-top: 6px;">直接将电脑上的文件或整个文件夹拖拽到此处，即可存入手机此目录</div>
+                <div style="font-size: 12px; color: #94a3b8; margin-top: 6px;">可按 Ctrl+V 直接粘贴电脑文件，或拖拽文件/文件夹存入此目录</div>
             </div>
         `;
         txtPhoneStorageStats.textContent = "空文件夹";
@@ -325,6 +518,7 @@ function renderDirectoryContent(data) {
     items.forEach(item => {
         const row = document.createElement('div');
         row.className = `phone-explorer-row ${item.is_dir ? 'is-directory' : 'is-file'}`;
+        row.setAttribute('data-path', item.path);
 
         const icon = item.is_dir ? '📁' : getFileIcon(item.name);
         const dateStr = item.modified ? new Date(item.modified * 1000).toLocaleString([], { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-';
@@ -344,14 +538,29 @@ function renderDirectoryContent(data) {
             <div class="col-action">${actionBtn}</div>
         `;
 
+        // Left click: select
+        row.addEventListener('click', (e) => {
+            selectItem(item, row);
+            hideContextMenu();
+        });
+
+        // Double click: open folder
         if (item.is_dir) {
-            row.addEventListener('click', () => {
+            row.addEventListener('dblclick', () => {
                 enterPhoneFolder(encodeURIComponent(item.path));
             });
             dirCount++;
         } else {
             fileCount++;
         }
+
+        // Right click: context menu
+        row.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            selectItem(item, row);
+            showContextMenu(e.clientX, e.clientY, item);
+        });
 
         phoneFileList.appendChild(row);
     });
@@ -391,6 +600,8 @@ async function disconnectDevice() {
     }
 }
 
+let pcWsPingTimer = null;
+
 // Setup WebSocket
 function initWebSocket() {
     const loc = window.location;
@@ -401,11 +612,12 @@ function initWebSocket() {
 
     ws.onopen = () => {
         console.log("PC UI WebSocket已连接");
-        setInterval(() => {
+        if (pcWsPingTimer) clearInterval(pcWsPingTimer);
+        pcWsPingTimer = setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send("ping");
             }
-        }, 15000);
+        }, 10000);
     };
 
     ws.onmessage = (event) => {
@@ -442,6 +654,13 @@ function initWebSocket() {
                 showNotification(`📥 收到来自手机的文件: ${msg.file.name}`);
             } else if (msg.type === 'file_sent') {
                 addHistoryItem(msg.file, true);
+            } else if (msg.type === 'operation_result') {
+                if (msg.message) {
+                    showNotification(msg.success ? `✅ ${msg.message}` : `❌ ${msg.message}`);
+                }
+                if (msg.refresh_path) {
+                    requestPhoneDirectory(msg.refresh_path);
+                }
             }
         } catch (e) {
             console.error("WS消息解析错误:", e);
@@ -535,7 +754,7 @@ async function sendBatchFiles(files, targetDir = "") {
 }
 
 // Package folder into a ZIP blob via JSZip and send
-async function packageFolderToZipAndSend(folderName, items, targetDir = "") {
+async function packageFolderToZipAndSend(folderName, items, targetDir = "", subDirs = []) {
     if (typeof JSZip === 'undefined') {
         alert("正在加载压缩模块，请稍候再试。");
         return;
@@ -549,6 +768,11 @@ async function packageFolderToZipAndSend(folderName, items, targetDir = "") {
     txtProgressPercent.textContent = '0%';
     progressBarFill.style.width = '0%';
     txtProgressSpeed.textContent = '正在读取文件...';
+
+    // Add empty sub-directories if any
+    for (const sub of subDirs) {
+        folder.folder(sub);
+    }
 
     // Add each file with its relative path
     for (const item of items) {
@@ -584,14 +808,20 @@ async function packageFolderToZipAndSend(folderName, items, targetDir = "") {
 }
 
 // Send folder preserving hierarchy
-async function sendFolderPreservingHierarchy(folderName, items, targetDir = "") {
+async function sendFolderPreservingHierarchy(folderName, items, targetDir = "", subDirs = []) {
+    // First, create the root folder and all sub-folders on phone
+    const rootTarget = targetDir ? `${targetDir}/${folderName}` : folderName;
+    await createPhoneDirectoryRemote(rootTarget);
+    for (const sub of subDirs) {
+        await createPhoneDirectoryRemote(`${rootTarget}/${sub}`);
+    }
+
     const total = items.length;
     for (let i = 0; i < total; i++) {
         const item = items[i];
-        // Calculate destination directory on phone
-        let destDir = targetDir ? `${targetDir}/${folderName}` : folderName;
+        let destDir = rootTarget;
         if (item.parentPath) {
-            destDir = `${destDir}/${item.parentPath}`;
+            destDir = `${rootTarget}/${item.parentPath}`;
         }
         const prefix = `[文件夹 ${i + 1}/${total}] `;
         await sendSingleFile(item.file, destDir, prefix);
@@ -606,7 +836,7 @@ async function sendFolderPreservingHierarchy(folderName, items, targetDir = "") 
 }
 
 // Choice Modal for Folder Transfer Strategy
-function showFolderChoiceDialog(folderName, items, targetDir = "") {
+function showFolderChoiceDialog(folderName, items, targetDir = "", subDirs = []) {
     return new Promise((resolve) => {
         let chosenMode = "zip"; // default recommended
 
@@ -640,9 +870,9 @@ function showFolderChoiceDialog(folderName, items, targetDir = "") {
         btnConfirmFolderChoice.onclick = async () => {
             cleanup();
             if (chosenMode === 'zip') {
-                await packageFolderToZipAndSend(folderName, items, targetDir);
+                await packageFolderToZipAndSend(folderName, items, targetDir, subDirs);
             } else {
-                await sendFolderPreservingHierarchy(folderName, items, targetDir);
+                await sendFolderPreservingHierarchy(folderName, items, targetDir, subDirs);
             }
             resolve(true);
         };
@@ -664,7 +894,7 @@ function showFolderChoiceDialog(folderName, items, targetDir = "") {
 // HTML5 Recursive DataTransfer Parser for Files and Folders
 async function parseDataTransfer(dataTransfer) {
     const singleFiles = [];
-    const folderGroups = {}; // folderName -> [ { file, relativePath, parentPath } ]
+    const folderGroups = {}; // folderName -> { items: [], subDirs: Set }
 
     async function readAllEntries(dirReader) {
         let entries = [];
@@ -687,8 +917,10 @@ async function parseDataTransfer(dataTransfer) {
         if (entry.isFile) {
             const file = await new Promise((res, rej) => entry.file(res, rej));
             if (rootFolderName) {
-                if (!folderGroups[rootFolderName]) folderGroups[rootFolderName] = [];
-                folderGroups[rootFolderName].push({
+                if (!folderGroups[rootFolderName]) {
+                    folderGroups[rootFolderName] = { items: [], subDirs: new Set() };
+                }
+                folderGroups[rootFolderName].items.push({
                     file: file,
                     relativePath: currentPath ? `${currentPath}/${file.name}` : file.name,
                     parentPath: currentPath
@@ -698,7 +930,13 @@ async function parseDataTransfer(dataTransfer) {
             }
         } else if (entry.isDirectory) {
             const curRoot = rootFolderName || entry.name;
+            if (!folderGroups[curRoot]) {
+                folderGroups[curRoot] = { items: [], subDirs: new Set() };
+            }
             const nextPath = rootFolderName ? (currentPath ? `${currentPath}/${entry.name}` : entry.name) : '';
+            if (nextPath) {
+                folderGroups[curRoot].subDirs.add(nextPath);
+            }
             const dirReader = entry.createReader();
             const entries = await readAllEntries(dirReader);
             for (const sub of entries) {
@@ -747,8 +985,22 @@ async function handleDroppedItems(dataTransfer, targetDir = "") {
 
         // 2. Prompt or process each dropped folder
         for (const name of folderNames) {
-            const items = folderGroups[name];
-            await showFolderChoiceDialog(name, items, targetDir);
+            const folderData = folderGroups[name];
+            const items = folderData.items;
+            const subDirs = Array.from(folderData.subDirs || []);
+
+            // If empty folder (no files inside)
+            if (items.length === 0) {
+                const rootTarget = targetDir ? `${targetDir}/${name}` : name;
+                await createPhoneDirectoryRemote(rootTarget);
+                for (const sub of subDirs) {
+                    await createPhoneDirectoryRemote(`${rootTarget}/${sub}`);
+                }
+                showNotification(`📁 已在手机端创建空文件夹: ${name}`);
+                setTimeout(() => requestPhoneDirectory(currentDirectoryPath), 800);
+            } else {
+                await showFolderChoiceDialog(name, items, targetDir, subDirs);
+            }
         }
     } catch (e) {
         console.error("处理拖拽项失败:", e);
@@ -1034,6 +1286,176 @@ btnOpenFolder.addEventListener('click', async () => {
         await fetch('/api/open_folder', { method: 'POST' });
     } catch (e) {
         alert("无法打开文件夹: " + e);
+    }
+});
+
+// Modal Paste & New Folder Button Listeners
+if (btnModalPaste) {
+    btnModalPaste.addEventListener('click', () => {
+        executePasteAction(currentDirectoryPath);
+    });
+}
+
+if (btnModalNewFolder) {
+    btnModalNewFolder.addEventListener('click', () => {
+        createNewFolderPrompt();
+    });
+}
+
+// Background right click on phoneFileList
+phoneFileList.addEventListener('contextmenu', (e) => {
+    if (!e.target.closest('.phone-explorer-row')) {
+        e.preventDefault();
+        clearSelection();
+        showContextMenu(e.clientX, e.clientY, null);
+    }
+});
+
+phoneFileList.addEventListener('click', (e) => {
+    if (!e.target.closest('.phone-explorer-row')) {
+        clearSelection();
+        hideContextMenu();
+    }
+});
+
+// Context Menu Event Handlers
+if (cmenuOpen) {
+    cmenuOpen.addEventListener('click', () => {
+        hideContextMenu();
+        if (selectedPhoneItem) {
+            if (selectedPhoneItem.is_dir) {
+                enterPhoneFolder(encodeURIComponent(selectedPhoneItem.path));
+            } else {
+                pullFileFromPhone(encodeURIComponent(selectedPhoneItem.path));
+            }
+        }
+    });
+}
+
+if (cmenuDownload) {
+    cmenuDownload.addEventListener('click', () => {
+        hideContextMenu();
+        if (selectedPhoneItem && !selectedPhoneItem.is_dir) {
+            pullFileFromPhone(encodeURIComponent(selectedPhoneItem.path));
+        }
+    });
+}
+
+if (cmenuCopy) {
+    cmenuCopy.addEventListener('click', () => {
+        hideContextMenu();
+        if (!selectedPhoneItem) return;
+        phoneClipboard = {
+            action: 'copy',
+            path: selectedPhoneItem.path,
+            name: selectedPhoneItem.name,
+            is_dir: selectedPhoneItem.is_dir
+        };
+        showNotification(`📋 已复制手机项: ${selectedPhoneItem.name}`);
+    });
+}
+
+if (cmenuCut) {
+    cmenuCut.addEventListener('click', () => {
+        hideContextMenu();
+        if (!selectedPhoneItem) return;
+        phoneClipboard = {
+            action: 'move',
+            path: selectedPhoneItem.path,
+            name: selectedPhoneItem.name,
+            is_dir: selectedPhoneItem.is_dir
+        };
+        document.querySelectorAll('.phone-explorer-row').forEach(r => r.classList.remove('is-cut'));
+        const curRow = document.querySelector(`.phone-explorer-row[data-path="${CSS.escape(selectedPhoneItem.path)}"]`);
+        if (curRow) curRow.classList.add('is-cut');
+        showNotification(`✂️ 已剪切手机项: ${selectedPhoneItem.name}`);
+    });
+}
+
+if (cmenuPaste) {
+    cmenuPaste.addEventListener('click', () => {
+        hideContextMenu();
+        executePasteAction(currentDirectoryPath);
+    });
+}
+
+if (cmenuRename) {
+    cmenuRename.addEventListener('click', () => {
+        hideContextMenu();
+        if (!selectedPhoneItem) return;
+        renamePhoneFileRemote(selectedPhoneItem.path, selectedPhoneItem.name);
+    });
+}
+
+if (cmenuNewFolder) {
+    cmenuNewFolder.addEventListener('click', () => {
+        hideContextMenu();
+        createNewFolderPrompt();
+    });
+}
+
+if (cmenuDelete) {
+    cmenuDelete.addEventListener('click', () => {
+        hideContextMenu();
+        if (!selectedPhoneItem) return;
+        deletePhoneFileRemote(selectedPhoneItem.path, selectedPhoneItem.is_dir);
+    });
+}
+
+// Close context menu on outside click
+document.addEventListener('click', (e) => {
+    if (explorerContextMenu && !explorerContextMenu.contains(e.target)) {
+        hideContextMenu();
+    }
+});
+
+// Keyboard shortcuts for Phone Explorer
+window.addEventListener('keydown', (e) => {
+    const isModalOpen = phoneStorageModal && phoneStorageModal.style.display !== 'none';
+    if (!isModalOpen) return;
+
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+    if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
+        if (selectedPhoneItem) {
+            e.preventDefault();
+            phoneClipboard = {
+                action: 'copy',
+                path: selectedPhoneItem.path,
+                name: selectedPhoneItem.name,
+                is_dir: selectedPhoneItem.is_dir
+            };
+            showNotification(`📋 已复制手机项: ${selectedPhoneItem.name}`);
+        }
+    } else if (e.ctrlKey && (e.key === 'x' || e.key === 'X')) {
+        if (selectedPhoneItem) {
+            e.preventDefault();
+            phoneClipboard = {
+                action: 'move',
+                path: selectedPhoneItem.path,
+                name: selectedPhoneItem.name,
+                is_dir: selectedPhoneItem.is_dir
+            };
+            document.querySelectorAll('.phone-explorer-row').forEach(r => r.classList.remove('is-cut'));
+            const curRow = document.querySelector(`.phone-explorer-row[data-path="${CSS.escape(selectedPhoneItem.path)}"]`);
+            if (curRow) curRow.classList.add('is-cut');
+            showNotification(`✂️ 已剪切手机项: ${selectedPhoneItem.name}`);
+        }
+    } else if (e.ctrlKey && (e.key === 'v' || e.key === 'V')) {
+        e.preventDefault();
+        executePasteAction(currentDirectoryPath);
+    } else if (e.key === 'Delete') {
+        if (selectedPhoneItem) {
+            e.preventDefault();
+            deletePhoneFileRemote(selectedPhoneItem.path, selectedPhoneItem.is_dir);
+        }
+    } else if (e.key === 'F2') {
+        if (selectedPhoneItem) {
+            e.preventDefault();
+            renamePhoneFileRemote(selectedPhoneItem.path, selectedPhoneItem.name);
+        }
+    } else if (e.key === 'Escape') {
+        hideContextMenu();
     }
 });
 

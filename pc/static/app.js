@@ -600,6 +600,8 @@ async function disconnectDevice() {
     }
 }
 
+let pcWsPingTimer = null;
+
 // Setup WebSocket
 function initWebSocket() {
     const loc = window.location;
@@ -610,11 +612,12 @@ function initWebSocket() {
 
     ws.onopen = () => {
         console.log("PC UI WebSocket已连接");
-        setInterval(() => {
+        if (pcWsPingTimer) clearInterval(pcWsPingTimer);
+        pcWsPingTimer = setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send("ping");
             }
-        }, 15000);
+        }, 10000);
     };
 
     ws.onmessage = (event) => {

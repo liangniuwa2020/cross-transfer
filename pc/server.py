@@ -760,4 +760,11 @@ app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-    uvicorn.run(app, host="0.0.0.0", port=52020)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=52020,
+        timeout_keep_alive=3600,
+        ws_ping_interval=15.0,
+        ws_ping_timeout=30.0
+    )

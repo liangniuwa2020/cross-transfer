@@ -71,6 +71,9 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener {
         networkManager = NetworkManager(this)
         networkManager.listener = this
 
+        // Prevent Android from sleeping and throttling network when user is not touching the screen
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         setupRecyclerView()
         setupListeners()
         updateConnectionUi(false, "未连接电脑", "")
