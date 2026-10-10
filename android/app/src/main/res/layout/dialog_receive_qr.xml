@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout 
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:gravity="center_horizontal"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="📱 手机接收与互传二维码"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textColor="#0F172A" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="使用另一台安卓手机打开快传扫此二维码，即刻建立互联"
+        android:textSize="12sp"
+        android:textColor="#64748B"
+        android:layout_marginTop="4dp"
+        android:gravity="center" />
+
+    <ImageView
+        android:id="@+id/ivPhoneQr"
+        android:layout_width="220dp"
+        android:layout_height="220dp"
+        android:layout_marginTop="16dp"
+        android:layout_marginBottom="12dp"
+        android:background="#F8FAFC"
+        android:padding="8dp" />
+
+    <TextView
+        android:id="@+id/tvPhoneServerIp"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="本机局域网地址: 192.168.1.100:52021"
+        android:textSize="13sp"
+        android:textStyle="bold"
+        android:textColor="#2563EB" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_marginTop="16dp"
+        android:background="#F1F5F9"
+        android:padding="12dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="当前接收文件保存位置:"
+            android:textSize="12sp"
+            android:textColor="#475569" />
+
+        <TextView
+            android:id="@+id/tvReceiveSavePath"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="/storage/emulated/0/Download/CrossTransfer"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:textColor="#0F172A"
+            android:layout_marginTop="2dp"
+            android:singleLine="true"
+            android:ellipsize="start" />
+
+        <Button
+            android:id="@+id/btnChangeSaveDir"
+            android:layout_width="match_parent"
+            android:layout_height="38dp"
+            android:text="📂 更改保存到的目标文件夹"
+            android:textSize="12sp"
+            android:layout_marginTop="8dp"
+            android:background="#E2E8F0"
+            android:textColor="#1E293B" />
+    </LinearLayout>
+
+</LinearLayout>

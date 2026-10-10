@@ -505,9 +505,9 @@ class NetworkManager(private val context: Context) {
         }
     }
 
-    fun sendFileDirect(file: File) {
+    fun sendFileDirect(file: File, targetDir: String = "") {
         if (!isConnected) {
-            listener?.onFileTransferFailed(file.name, "未连接到电脑")
+            listener?.onFileTransferFailed(file.name, "未连接到对端设备")
             return
         }
 
@@ -554,17 +554,24 @@ class NetworkManager(private val context: Context) {
                     }
                 }
 
-                val multipartBody = MultipartBody.Builder()
+                val multipartBuilder = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("file", fileName, requestBody)
-                    .build()
+                
+                if (targetDir.isNotEmpty()) {
+                    multipartBuilder.addFormDataPart("target_dir", targetDir)
+                }
 
-                val request = Request.Builder()
+                val requestBuilder = Request.Builder()
                     .url(uploadUrl)
-                    .post(multipartBody)
-                    .build()
+                    .post(multipartBuilder.build())
+                
+                if (targetDir.isNotEmpty()) {
+                    requestBuilder.addHeader("X-Target-Dir", java.net.URLEncoder.encode(targetDir, "UTF-8"))
+                }
+                requestBuilder.addHeader("X-File-Name", java.net.URLEncoder.encode(fileName, "UTF-8"))
 
-                val response = client.newCall(request).execute()
+                val response = client.newCall(requestBuilder.build()).execute()
                 if (response.isSuccessful) {
                     val item = FileItem(
                         id = System.currentTimeMillis().toString(),
@@ -579,7 +586,7 @@ class NetworkManager(private val context: Context) {
                     }
                 } else {
                     mainHandler.post {
-                        listener?.onFileTransferFailed(fileName, "PC响应错误: ${response.code}")
+                        listener?.onFileTransferFailed(fileName, "响应错误: ${response.code}")
                     }
                 }
             } catch (e: Exception) {
@@ -591,9 +598,9 @@ class NetworkManager(private val context: Context) {
         }.start()
     }
 
-    fun sendFile(uri: Uri) {
+    fun sendFile(uri: Uri, targetDir: String = "") {
         if (!isConnected) {
-            listener?.onFileTransferFailed("未知文件", "未连接到电脑")
+            listener?.onFileTransferFailed("未知文件", "未连接到对端设备")
             return
         }
 
@@ -645,17 +652,24 @@ class NetworkManager(private val context: Context) {
                     }
                 }
 
-                val multipartBody = MultipartBody.Builder()
+                val multipartBuilder = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("file", fileName, requestBody)
-                    .build()
+                
+                if (targetDir.isNotEmpty()) {
+                    multipartBuilder.addFormDataPart("target_dir", targetDir)
+                }
 
-                val request = Request.Builder()
+                val requestBuilder = Request.Builder()
                     .url(uploadUrl)
-                    .post(multipartBody)
-                    .build()
+                    .post(multipartBuilder.build())
+                
+                if (targetDir.isNotEmpty()) {
+                    requestBuilder.addHeader("X-Target-Dir", java.net.URLEncoder.encode(targetDir, "UTF-8"))
+                }
+                requestBuilder.addHeader("X-File-Name", java.net.URLEncoder.encode(fileName, "UTF-8"))
 
-                val response = client.newCall(request).execute()
+                val response = client.newCall(requestBuilder.build()).execute()
                 if (response.isSuccessful) {
                     val item = FileItem(
                         id = System.currentTimeMillis().toString(),
@@ -670,7 +684,7 @@ class NetworkManager(private val context: Context) {
                     }
                 } else {
                     mainHandler.post {
-                        listener?.onFileTransferFailed(fileName, "PC响应错误: ${response.code}")
+                        listener?.onFileTransferFailed(fileName, "响应错误: ${response.code}")
                     }
                 }
             } catch (e: Exception) {

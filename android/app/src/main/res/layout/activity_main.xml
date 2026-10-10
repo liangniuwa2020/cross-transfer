@@ -43,22 +43,37 @@
                     <TextView
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Android ⇄ Windows 免流量超快直传"
+                        android:text="Android ⇄ PC / 安卓 ⇄ 安卓 极速直传"
                         android:textSize="13sp"
                         android:textColor="#64748B"
                         android:layout_marginTop="2dp" />
                 </LinearLayout>
 
                 <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnShowMyQr"
+                    android:layout_width="wrap_content"
+                    android:layout_height="44dp"
+                    android:text="📲 本机互联码"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:textColor="#1D4ED8"
+                    app:backgroundTint="#EFF6FF"
+                    app:strokeColor="#BFDBFE"
+                    app:strokeWidth="1dp"
+                    app:cornerRadius="10dp"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_marginEnd="8dp" />
+
+                <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnScanQr"
                     android:layout_width="wrap_content"
-                    android:layout_height="48dp"
-                    android:text="📷 扫码互联"
-                    android:textSize="14sp"
+                    android:layout_height="44dp"
+                    android:text="📷 扫码连接"
+                    android:textSize="13sp"
                     android:textStyle="bold"
                     android:textColor="#FFFFFF"
                     app:backgroundTint="#2563EB"
-                    app:cornerRadius="12dp" />
+                    app:cornerRadius="10dp" />
             </LinearLayout>
 
             <!-- Device Connection Card -->
@@ -238,11 +253,79 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- Action Buttons: Send to PC -->
+            <!-- Target Folder Bar (Custom Save Directory Selection) -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:cardCornerRadius="14dp"
+                app:cardElevation="1dp"
+                app:strokeWidth="1dp"
+                app:strokeColor="#CBD5E1"
+                app:cardBackgroundColor="#FFFFFF"
+                android:layout_marginBottom="16dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="14dp">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical">
+
+                        <LinearLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="📂 接收文件保存位置 (可任意指定)"
+                                android:textSize="14sp"
+                                android:textStyle="bold"
+                                android:textColor="#0F172A" />
+
+                            <TextView
+                                android:id="@+id/tvCurrentSaveDir"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="Download/CrossTransfer (点击右侧更改)"
+                                android:textSize="12sp"
+                                android:textColor="#64748B"
+                                android:singleLine="true"
+                                android:ellipsize="middle"
+                                android:layout_marginTop="2dp" />
+                        </LinearLayout>
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnSelectSaveDir"
+                            android:layout_width="wrap_content"
+                            android:layout_height="38dp"
+                            android:text="更改文件夹"
+                            android:textSize="12sp"
+                            android:textStyle="bold"
+                            android:textColor="#2563EB"
+                            app:backgroundTint="#EFF6FF"
+                            app:strokeColor="#BFDBFE"
+                            app:strokeWidth="1dp"
+                            app:cornerRadius="8dp"
+                            style="@style/Widget.Material3.Button.TonalButton"
+                            android:layout_marginStart="8dp" />
+                    </LinearLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- Action Buttons: Send to Connected Device -->
             <TextView
+                android:id="@+id/tvSendSectionTitle"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="发送给电脑"
+                android:text="发送给对端设备 (电脑 / 安卓手机)"
                 android:textSize="16sp"
                 android:textStyle="bold"
                 android:textColor="#0F172A"
