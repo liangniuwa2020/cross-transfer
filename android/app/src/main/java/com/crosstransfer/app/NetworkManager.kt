@@ -48,6 +48,8 @@ class NetworkManager(private val context: Context) {
         private set
     var isConnected: Boolean = false
         private set
+    var isPhonePeer: Boolean = false
+        private set
 
     private var autoReconnectEnabled = false
     private var reconnectAttempts = 0
@@ -58,12 +60,44 @@ class NetworkManager(private val context: Context) {
 
     private val appPingRunnable = object : Runnable {
         override fun run() {
-            if (isConnected && webSocket != null) {
-                try {
-                    webSocket?.send("ping")
-                } catch (_: Exception) {}
+            if (isConnected) {
+                if (isPhonePeer) {
+                    Thread {
+                        try {
+                            val pingReq = Request.Builder()
+                                .url("http://$serverHost:$serverPort/api/ping")
+                                .get()
+                                .build()
+                            val resp = client.newCall(pingReq).execute()
+                            resp.close()
+                        } catch (e: Exception) {
+                            if (isConnected && isPhonePeer) {
+                                mainHandler.post {
+                                    disconnect("与对端手机连接断开")
+                                }
+                            }
+                        }
+                    }.start()
+                } else if (webSocket != null) {
+                    try {
+                        webSocket?.send("ping")
+                    } catch (_: Exception) {}
+                }
                 mainHandler.postDelayed(this, 15000)
             }
+        }
+    }
+
+    fun markPeerConnected(peerName: String, host: String, port: Int) {
+        serverHost = host
+        serverPort = port
+        isConnected = true
+        isPhonePeer = true
+        autoReconnectEnabled = false
+        mainHandler.removeCallbacks(appPingRunnable)
+        mainHandler.post(appPingRunnable)
+        mainHandler.post {
+            listener?.onConnected(peerName, host, port)
         }
     }
 
@@ -79,12 +113,19 @@ class NetworkManager(private val context: Context) {
     private fun internalConnect(host: String, port: Int, pin: String) {
         closeWebSocketInternal()
 
+        // 如果端口是手机服务端端口(52021)，优先使用对等安卓互联握手协议
+        if (port == 52021) {
+            connectPhonePeer(host, port)
+            return
+        }
+
         val wsUrl = "ws://$host:$port/ws?device=android&model=${android.os.Build.MODEL}&pin=$pin"
         val request = Request.Builder().url(wsUrl).build()
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 isConnected = true
+                isPhonePeer = false
                 reconnectAttempts = 0
                 mainHandler.removeCallbacks(appPingRunnable)
                 mainHandler.post(appPingRunnable)
@@ -197,6 +238,54 @@ class NetworkManager(private val context: Context) {
         })
     }
 
+    private fun connectPhonePeer(host: String, port: Int) {
+        Thread {
+            try {
+                // 向对端安卓机发送握手
+                val payload = JSONObject().apply {
+                    put("type", "phone_client")
+                    put("model", Build.MODEL)
+                    put("brand", Build.BRAND)
+                    put("name", "${Build.BRAND} ${Build.MODEL}")
+                    put("ip", "")
+                    put("port", 52021)
+                }
+                val body = RequestBody.create("application/json; charset=utf-8".toMediaTypeOrNull(), payload.toString())
+                val req = Request.Builder()
+                    .url("http://$host:$port/api/connect_peer")
+                    .post(body)
+                    .build()
+
+                val resp = client.newCall(req).execute()
+                if (resp.isSuccessful) {
+                    val respStr = resp.body?.string() ?: "{}"
+                    val respJson = JSONObject(respStr)
+                    val peerName = respJson.optString("name", respJson.optString("model", "安卓对端手机"))
+                    isConnected = true
+                    isPhonePeer = true
+                    reconnectAttempts = 0
+                    mainHandler.removeCallbacks(appPingRunnable)
+                    mainHandler.post(appPingRunnable)
+                    mainHandler.post {
+                        listener?.onConnected(peerName, host, port)
+                    }
+                } else {
+                    mainHandler.post {
+                        listener?.onDisconnected("对端手机拒绝连接 (HTTP ${resp.code})")
+                    }
+                }
+            } catch (e: Exception) {
+                if (autoReconnectEnabled) {
+                    scheduleReconnect("连接对端手机失败，正在尝试重连...")
+                } else {
+                    mainHandler.post {
+                        listener?.onDisconnected("连接对端手机失败: ${e.localizedMessage ?: "网络超时"}")
+                    }
+                }
+            }
+        }.start()
+    }
+
     private fun scheduleReconnect(notice: String) {
         if (!autoReconnectEnabled || serverHost.isEmpty()) return
         reconnectAttempts++
@@ -230,12 +319,24 @@ class NetworkManager(private val context: Context) {
 
     fun disconnectByUser() {
         autoReconnectEnabled = false
-        try {
-            val json = JSONObject()
-            json.put("action", "phone_disconnect")
-            webSocket?.send(json.toString())
-            webSocket?.close(1000, "手机主动断开")
-        } catch (_: Exception) {}
+        if (isPhonePeer && serverHost.isNotEmpty()) {
+            Thread {
+                try {
+                    val req = Request.Builder()
+                        .url("http://$serverHost:$serverPort/api/disconnect_peer")
+                        .get()
+                        .build()
+                    client.newCall(req).execute().close()
+                } catch (_: Exception) {}
+            }.start()
+        } else {
+            try {
+                val json = JSONObject()
+                json.put("action", "phone_disconnect")
+                webSocket?.send(json.toString())
+                webSocket?.close(1000, "手机主动断开")
+            } catch (_: Exception) {}
+        }
         closeWebSocketInternal()
         mainHandler.post {
             listener?.onDisconnected("已主动断开连接")

@@ -4,6 +4,32 @@
 
 ---
 
+## 📌 [v1.4.1] - 2026-10-10 23:25
+
+### 1. 修改目的与问题排查
+* 解决用户反馈的严重 Bug：“**cross-transfer项目 安卓设备对安卓设备无法连接**”。
+* **根本原因分析**：
+  1. **协议层 WebSocket 404**：扫码端客户端在 `NetworkManager.kt` 中发起 `ws://[ip]:52021/ws` 握手，但被扫端手机运行的 `PhoneHttpServer.kt` 仅有简单 HTTP 处理，未处理 WebSocket 升级导致返回 `404 Not Found`，OkHttp 报错崩溃并进入无限重试；
+  2. **被扫端 UI 连接状态未触发**：被扫端手机作为服务端在建立连接时只弹出 Toast，未更新 UI 状态（未调用 `updateConnectionUi(true)`），按钮仍保持未连接不可用状态；
+  3. **双向对称性缺失**：被扫端没有记录客户端的 IP/端口与型号，无法实现双机对等双向互发；
+  4. **手动输入 IP 端口不匹配**：手动连接默认端口为 52020（PC 端端口），导致手动输入对端手机 IP 时无法连通。
+
+### 2. 具体修复与功能增强
+* **【双向对等 HTTP 握手与保活架构】**：
+  * 在 `PhoneHttpServer.kt` 中新增 `/api/connect_peer` 和 `/api/disconnect_peer` 对等握手协议；
+  * 在 `NetworkManager.kt` 中适配对等安卓机连接（识别端口 52021 或对等标记），发起对等 HTTP 握手，双方互换 IP、端口与机型；
+  * 在 `PhoneHttpServer.ServerListener` 中新增 `onClientConnected(clientInfo, clientIp, clientPort)` 回调，被扫端自动记录主连端 IP 并通过 `markPeerConnected` 将自身状态同步为已连接；
+  * 增加基于 `/api/ping` 的定时心跳保活机制，断开时自动通知对端并安全清理状态；
+* **【主界面与操作互通】**：
+  * 扫码或手动连接后，**两台手机屏幕同时瞬间亮起绿色圆点并显示“🟢 已连接到: [对端机型]”**；
+  * 两台手机均可立即点击【📦 文件/压缩包】或【🖼️ 相册照片/视频】，互相推送到对方指定的文件夹；
+  * 手动输入 IP 连接逻辑支持智能推断，可输入 `IP:52021` 或直接输入对端 IP 连接。
+* **【版本与产物】**：
+  * `versionCode` 升级至 `8`，`versionName` 升级至 `"1.4.1"`。
+  * 编译生成最新发布包：`bin/CrossTransfer.apk` 与 `bin/CrossTransfer_v1.4.1.apk`（6.8 MB）。
+
+---
+
 ## 📌 [v1.4.0] - 2026-10-10 22:30
 
 ### 1. 修改目的与用户需求

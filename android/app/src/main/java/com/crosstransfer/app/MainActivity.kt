@@ -136,6 +136,10 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
                 val parts = ipText.split(":")
                 host = parts[0]
                 port = parts[1].toIntOrNull() ?: 52020
+            } else {
+                // 如果未带端口，尝试以 52021（手机端）连接或 52020（电脑端）
+                // 默认端口设为 52020，如果用户输入的是对端手机也可以连接
+                port = 52020
             }
             binding.tvConnectionStatus.text = "正在连接 $host:$port ..."
             networkManager.connect(host, port)
@@ -359,7 +363,7 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
     // --- NetworkManager.ConnectionListener (客户端主动连接时的回调) ---
 
     override fun onConnected(serverName: String, host: String, port: Int) {
-        val typeName = if (port == 52021) "安卓对端手机" else serverName
+        val typeName = if (serverName.isNotBlank() && serverName != "Windows PC") serverName else if (port == 52021) "安卓对端手机" else serverName
         updateConnectionUi(true, "🟢 已连接到: $typeName", "设备地址: $host:$port (连接正常)")
         Toast.makeText(this, "已成功互联设备: $typeName", Toast.LENGTH_SHORT).show()
     }
@@ -441,14 +445,22 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
         // 服务启动就绪
     }
 
-    override fun onClientConnected(clientInfo: String) {
+    override fun onClientConnected(clientInfo: String, clientIp: String, clientPort: Int) {
         runOnUiThread {
-            Toast.makeText(this, "安卓机已连接: $clientInfo", Toast.LENGTH_SHORT).show()
+            if (clientIp.isNotEmpty()) {
+                networkManager.markPeerConnected(clientInfo, clientIp, clientPort)
+            } else {
+                updateConnectionUi(true, "🟢 已连接到: $clientInfo", "对端安卓手机已建立互联通道")
+            }
+            Toast.makeText(this, "对端安卓机已连接: $clientInfo", Toast.LENGTH_SHORT).show()
         }
     }
 
     override fun onClientDisconnected() {
-        // 客户端断开
+        runOnUiThread {
+            updateConnectionUi(false, "🔴 对端设备已断开", "请点击右上角扫码连接电脑或对端手机")
+            Toast.makeText(this, "对端设备已断开连接", Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onDestroy() {

@@ -23,7 +23,7 @@ class PhoneHttpServer(
 ) {
     interface ServerListener {
         fun onServerStarted(ip: String, port: Int)
-        fun onClientConnected(clientInfo: String)
+        fun onClientConnected(clientInfo: String, clientIp: String = "", clientPort: Int = 52021)
         fun onClientDisconnected()
         fun onFileTransferStarted(fileName: String, totalBytes: Long, isUpload: Boolean)
         fun onFileTransferProgress(transferredBytes: Long, totalBytes: Long, speedBps: Long)
@@ -154,6 +154,8 @@ class PhoneHttpServer(
 
                 when {
                     path.startsWith("/api/info") -> handleApiInfo(outputStream!!)
+                    path.startsWith("/api/connect_peer") -> handleConnectPeer(headers, inputStream!!, outputStream!!)
+                    path.startsWith("/api/disconnect_peer") -> handleDisconnectPeer(outputStream!!)
                     path.startsWith("/api/upload") -> handleUpload(headers, inputStream!!, outputStream!!)
                     path.startsWith("/api/list_directory") -> handleListDirectory(path, outputStream!!)
                     path.startsWith("/api/ping") -> handlePing(outputStream!!)
@@ -164,6 +166,50 @@ class PhoneHttpServer(
             } finally {
                 close()
             }
+        }
+
+        private fun handleConnectPeer(headers: Map<String, String>, input: InputStream, out: OutputStream) {
+            val length = headers["content-length"]?.toIntOrNull() ?: 0
+            var clientIp = socket.inetAddress?.hostAddress ?: ""
+            var clientPort = 52021
+            var modelName = "安卓手机"
+
+            if (length > 0) {
+                val bytes = ByteArray(length)
+                var read = 0
+                while (read < length) {
+                    val r = input.read(bytes, read, length - read)
+                    if (r == -1) break
+                    read += r
+                }
+                val bodyStr = String(bytes, Charsets.UTF_8)
+                try {
+                    val bodyJson = JSONObject(bodyStr)
+                    val ip = bodyJson.optString("ip", "")
+                    if (ip.isNotEmpty()) clientIp = ip
+                    clientPort = bodyJson.optInt("port", 52021)
+                    modelName = bodyJson.optString("name", bodyJson.optString("model", "安卓手机"))
+                } catch (_: Exception) {}
+            }
+
+            listener?.onClientConnected(modelName, clientIp, clientPort)
+
+            val json = JSONObject()
+            json.put("status", "ok")
+            json.put("device", "android_phone")
+            json.put("model", Build.MODEL)
+            json.put("brand", Build.BRAND)
+            json.put("name", "${Build.BRAND} ${Build.MODEL}")
+            json.put("port", port)
+            json.put("custom_save_dir", customSaveDir)
+            sendResponse(out, 200, "application/json; charset=utf-8", json.toString())
+        }
+
+        private fun handleDisconnectPeer(out: OutputStream) {
+            listener?.onClientDisconnected()
+            val json = JSONObject()
+            json.put("status", "ok")
+            sendResponse(out, 200, "application/json", json.toString())
         }
 
         private fun handleApiInfo(out: OutputStream) {
