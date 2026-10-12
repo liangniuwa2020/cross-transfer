@@ -52,8 +52,8 @@ def run_server():
         port=PORT,
         log_level="warning",
         timeout_keep_alive=3600,
-        ws_ping_interval=15.0,
-        ws_ping_timeout=30.0
+        ws_ping_interval=10.0,
+        ws_ping_timeout=60.0
     )
 
 def main():

@@ -17,6 +17,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
+import android.net.wifi.WifiManager
+import android.os.PowerManager
 import com.crosstransfer.app.databinding.ActivityMainBinding
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -34,6 +36,9 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
     private val fileList = mutableListOf<FileItem>()
     private val pendingUrisToSend = LinkedList<Uri>()
     private var isSendingQueue = false
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     // 当前指定的目标保存文件夹 (可由用户任意选择设定)
     private var currentSaveDirectory: String = ""
@@ -92,6 +97,23 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
 
         // 保持屏幕常亮
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // 保持后台运行与 WiFi 高性能低延迟，防止休眠断开 Socket
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CrossTransfer::WakeLock")
+            wakeLock?.acquire(3600 * 1000L) // 保持 1 小时
+        } catch (_: Exception) {}
+
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "CrossTransfer::WifiLock")
+            } else {
+                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "CrossTransfer::WifiLock")
+            }
+            wifiLock?.acquire()
+        } catch (_: Exception) {}
 
         setupRecyclerView()
         setupListeners()
@@ -479,6 +501,12 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (_: Exception) {}
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (_: Exception) {}
         phoneHttpServer.stop()
         networkManager.disconnect("应用关闭")
     }

@@ -4,6 +4,37 @@
 
 ---
 
+## 📌 [v1.4.3] - 2026-10-12 12:15
+
+### 1. 修改目的与问题排查
+* 彻底解决用户反馈的核心稳定性问题：“**连接以后，很快会断开，和电脑也是这样，请找出原因并解决**”。
+* **根本原因深度排查与剖析**：
+  1. **【手机对等互联：单次心跳失败即触发断开（零容错陷阱）】**：
+     在 `NetworkManager.kt` 的 `appPingRunnable` 中，定时每隔 15 秒向对端手机 `/api/ping` 发送心跳包。由于使用的是单次捕获模式，只要局域网环境（WiFi 漫游、手机信号波动、信道繁忙、后台休眠节流）出现一次轻微丢包或耗时超过默认超时，`catch (e: Exception)` 块会**立即判定连接失效并无情触发 `disconnect("与对端手机连接断开")`**，完全没有任何重试缓冲或容错重连窗口，导致连接后往往仅维持几十秒到几分钟便突然闪断；
+  2. **【手机端与电脑端：双重 Ping 冲突与 Uvicorn/OkHttp 心跳竞争】**：
+     * **手机连接电脑端时**：OkHttp 配置了 `pingInterval(10, TimeUnit.SECONDS)`（底层发送 WebSocket Ping 帧），同时 `appPingRunnable` 又在应用层每隔 15 秒发送字符串 `"ping"`，PC 端服务同时回复字符串 `"pong"`；
+     * **严重问题**：手机端在 `onMessage` 收到该文本 `"pong"` 时，直接尝试执行 `val json = JSONObject(text)` 进行 JSON 解析！当解析文本 `"pong"` 抛出 `JSONException` 被捕获时，若遇到连接底层帧时序微小延迟，容易产生误判；
+     * 电脑端 Uvicorn 配置的 `ws_ping_timeout` 原仅为 30 秒，一旦手机屏幕降频或无线 AP 发生轻微抖动，极易触发服务端的超时断开（WebSocket 1006 / 1000）；
+  3. **【Android 系统的后台节能休眠限制（Doze 模式与 WiFi 节能模式）】**：
+     手机在没有前台高强度操作时，系统电源管理会将无线网卡转入省电节能低功率状态（WiFi Power Save Polling），甚至冻结无 WakeLock/WifiLock 的 Socket 传输，引发底层 TCP 连接无响应中断。
+
+### 2. 具体修复与架构防断优化
+* **【心跳容错防抖机制（支持 3 次连续失败缓冲）】**：
+  * 为 `NetworkManager.kt` 引入专用快速心跳 Client（`pingClient`：5s 独立超时）；
+  * 引入 `consecutivePingFailures` 连续失败计数器，**允许单次/偶发性网络抖动自动忽略，仅在连续 3 次心跳均未响应时才判定掉线**；
+  * 被扫端（通过 `markPeerConnected` 进入连接状态）同样开启 `autoReconnectEnabled = true`，当偶发网络波动恢复后可自动回连，不再静默退回断开界面。
+* **【统一心跳通道与消除 JSON 崩溃隐患】**：
+  * 在 `NetworkManager.kt` 的 `onMessage` 中增加对纯文本 `"pong"` / `"ping"` 的预过滤，不再进入 `JSONObject()` 解析，避免无意义的异常抛出；
+  * PC 服务端（`server.py` 与 `main.py`）将 `ws_ping_timeout` 从 30s 宽限至 60s，心跳间隔对齐为 10s，彻底消除因心跳时序竞争引发的超时断连。
+* **【多重保活唤醒锁（WakeLock + WifiLock）】**：
+  * 在 `AndroidManifest.xml` 中增加 `android.permission.WAKE_LOCK`；
+  * 在 `MainActivity.kt` 初始化时获取 `PowerManager.PARTIAL_WAKE_LOCK` 以及 `WifiManager.WIFI_MODE_FULL_LOW_LATENCY`（低版本 fallback 为 `WIFI_MODE_FULL_HIGH_PERF`），确保在互联过程中手机无线芯片保持全速低延迟工作，防止系统节能策略杀死后台 Socket 通信。
+* **【版本与产物】**：
+  * `versionCode` 升级至 `10`，`versionName` 升级至 `"1.4.3"`。
+  * 重新编译生成发布包：`bin/CrossTransfer.apk` 与 `bin/CrossTransfer_v1.4.3.apk`。
+
+---
+
 ## 📌 [v1.4.2] - 2026-10-12 11:20
 
 ### 1. 修改目的与问题排查

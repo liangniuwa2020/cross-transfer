@@ -37,7 +37,12 @@ class NetworkManager(private val context: Context) {
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS) // infinite for websockets & big downloads
         .writeTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(10, TimeUnit.SECONDS) // OkHttp native WebSocket PING frame every 10s to keep NAT/AP alive
+        .retryOnConnectionFailure(true)
+        .build()
+
+    private var pingClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
@@ -54,6 +59,7 @@ class NetworkManager(private val context: Context) {
     private var autoReconnectEnabled = false
     private var reconnectAttempts = 0
     private var lastPin: String = ""
+    private var consecutivePingFailures = 0
 
     var listener: ConnectionListener? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -68,12 +74,28 @@ class NetworkManager(private val context: Context) {
                                 .url("http://$serverHost:$serverPort/api/ping")
                                 .get()
                                 .build()
-                            val resp = client.newCall(pingReq).execute()
+                            val resp = pingClient.newCall(pingReq).execute()
+                            val isOk = resp.isSuccessful
                             resp.close()
+                            if (isOk) {
+                                consecutivePingFailures = 0
+                            } else {
+                                consecutivePingFailures++
+                            }
                         } catch (e: Exception) {
+                            consecutivePingFailures++
+                        }
+
+                        // 允许连续失败 3 次再断开，防止局域网偶发波动导致瞬间掉线
+                        if (consecutivePingFailures >= 3) {
                             if (isConnected && isPhonePeer) {
-                                mainHandler.post {
-                                    disconnect("与对端手机连接断开")
+                                isConnected = false
+                                if (autoReconnectEnabled) {
+                                    scheduleReconnect("与对端手机通信中断，正在尝试恢复...")
+                                } else {
+                                    mainHandler.post {
+                                        listener?.onDisconnected("与对端手机连接断开")
+                                    }
                                 }
                             }
                         }
@@ -83,7 +105,7 @@ class NetworkManager(private val context: Context) {
                         webSocket?.send("ping")
                     } catch (_: Exception) {}
                 }
-                mainHandler.postDelayed(this, 15000)
+                mainHandler.postDelayed(this, 10000)
             }
         }
     }
@@ -93,7 +115,9 @@ class NetworkManager(private val context: Context) {
         serverPort = port
         isConnected = true
         isPhonePeer = true
-        autoReconnectEnabled = false
+        autoReconnectEnabled = true
+        consecutivePingFailures = 0
+        reconnectAttempts = 0
         mainHandler.removeCallbacks(appPingRunnable)
         mainHandler.post(appPingRunnable)
         mainHandler.post {
@@ -107,6 +131,7 @@ class NetworkManager(private val context: Context) {
     fun connect(host: String, port: Int, pin: String = "", candidateIps: List<String> = emptyList()) {
         autoReconnectEnabled = true
         reconnectAttempts = 0
+        consecutivePingFailures = 0
         lastPin = pin
         serverHost = host
         serverPort = port
@@ -131,6 +156,7 @@ class NetworkManager(private val context: Context) {
                 isConnected = true
                 isPhonePeer = false
                 reconnectAttempts = 0
+                consecutivePingFailures = 0
                 mainHandler.removeCallbacks(appPingRunnable)
                 mainHandler.post(appPingRunnable)
                 mainHandler.post {
@@ -139,6 +165,9 @@ class NetworkManager(private val context: Context) {
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
+                if (text == "pong" || text == "ping") {
+                    return
+                }
                 try {
                     val json = JSONObject(text)
                     when (json.optString("action")) {

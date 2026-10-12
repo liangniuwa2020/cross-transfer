@@ -765,6 +765,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=52020,
         timeout_keep_alive=3600,
-        ws_ping_interval=15.0,
-        ws_ping_timeout=30.0
+        ws_ping_interval=10.0,
+        ws_ping_timeout=60.0
     )
