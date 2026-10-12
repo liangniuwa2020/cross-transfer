@@ -137,12 +137,11 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
                 host = parts[0]
                 port = parts[1].toIntOrNull() ?: 52020
             } else {
-                // 如果未带端口，尝试以 52021（手机端）连接或 52020（电脑端）
-                // 默认端口设为 52020，如果用户输入的是对端手机也可以连接
+                // 默认尝试电脑端口 52020，失败时 NetworkManager 会自动探测手机端口 52021
                 port = 52020
             }
             binding.tvConnectionStatus.text = "正在连接 $host:$port ..."
-            networkManager.connect(host, port)
+            networkManager.connect(host, port, candidateIps = listOf(host))
         }
 
         binding.tvDisconnect.setOnClickListener {
@@ -236,14 +235,26 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
         var port = 52020
         var pin = ""
         var targetModel = ""
+        val candidateIps = mutableListOf<String>()
 
         try {
             if (content.startsWith("{")) {
                 val json = JSONObject(content)
                 host = json.optString("ip")
-                if (host.isEmpty() && json.has("ips")) {
+                if (json.has("ips")) {
                     val ipsArr = json.getJSONArray("ips")
-                    if (ipsArr.length() > 0) host = ipsArr.getString(0)
+                    for (i in 0 until ipsArr.length()) {
+                        val ip = ipsArr.getString(i)
+                        if (ip.isNotBlank() && !candidateIps.contains(ip)) {
+                            candidateIps.add(ip)
+                        }
+                    }
+                    if (host.isEmpty() && candidateIps.isNotEmpty()) {
+                        host = candidateIps[0]
+                    }
+                }
+                if (host.isNotEmpty() && !candidateIps.contains(host)) {
+                    candidateIps.add(0, host)
                 }
                 port = json.optInt("port", 52020)
                 pin = json.optString("pin", "")
@@ -251,6 +262,7 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
             } else if (content.startsWith("http://") || content.startsWith("https://")) {
                 val uri = URI(content)
                 host = uri.host ?: ""
+                if (host.isNotEmpty()) candidateIps.add(host)
                 port = if (uri.port > 0) uri.port else 52020
                 val query = uri.query ?: ""
                 if (query.contains("pin=")) {
@@ -259,15 +271,17 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
             } else if (content.contains(":")) {
                 val parts = content.split(":")
                 host = parts[0]
+                if (host.isNotEmpty()) candidateIps.add(host)
                 port = parts[1].toIntOrNull() ?: 52020
             } else {
                 host = content
+                if (host.isNotEmpty()) candidateIps.add(host)
             }
 
             if (host.isNotEmpty()) {
                 val tipName = if (targetModel.isNotEmpty()) targetModel else "$host:$port"
                 binding.tvConnectionStatus.text = "正在连接设备 $tipName ..."
-                networkManager.connect(host, port, pin)
+                networkManager.connect(host, port, pin, candidateIps)
             } else {
                 Toast.makeText(this, "无效的二维码内容", Toast.LENGTH_SHORT).show()
             }

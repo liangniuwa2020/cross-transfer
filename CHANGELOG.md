@@ -4,6 +4,35 @@
 
 ---
 
+## 📌 [v1.4.2] - 2026-10-12 11:20
+
+### 1. 修改目的与问题排查
+* 彻底解决用户反馈的核心痛点：“**cross-transfer 安卓设备之间互扫，不能连接**”。
+* **根本原因深度剖析**：
+  1. **【Socket 字节流与 BufferedReader 预读缓冲区冲突（致命挂起）】**：
+     在 `PhoneHttpServer.kt` 的 `ClientConnection` 线程中，首先创建了 `BufferedReader(InputStreamReader(inputStream, "UTF-8"))` 并循环调用 `readLine()` 读取 HTTP 请求头。由于 `BufferedReader` 默认拥有 8KB 字符缓冲区，当对端手机发送的 HTTP POST `/api/connect_peer` 请求头较小（几十字节到几百字节），整段包含 JSON 请求体的全部数据已在解析头部时被 `BufferedReader` 预读并缓存在内存缓冲区中。紧接着 `handleConnectPeer()` 却尝试从底层原始 `inputStream.read()` 读取 `content-length` 字节——此时底层 TCP Socket 中已无剩余数据，导致 `inputStream.read()` 发生永久阻塞挂起，直至 OkHttp 超时抛出 `SocketTimeoutException`，导致扫码握手失败！
+  2. **【单 IP 二维码与多网卡/热点环境不匹配】**：
+     Android 手机在无路由器环境常用一台手机开启便携热点（网卡如 `ap0`, `rndis0`，IP 通常为 `192.168.43.1`），另一台手机连接热点（网卡为 `wlan0`，IP 通常为 `192.168.43.x`）。原实现仅检查了在 Android 10+ 上经常受限返回 0 的 `WifiInfo.ipAddress`，或遍历网卡时顺序受干扰可能落入回环地址 `127.0.0.1` 或错误的私网 IP，且二维码中只输出单一 `ip` 字段，导致扫码端按错误的单一 IP 无法发起握手。
+  3. **【手动连接与单端口回退机制】**：
+     手动输入 IP 时，若未携带端口则仅尝试 52020，遇到手机端时若未能即时回退到 52021 则提示连接失败。
+
+### 2. 具体修复与功能增强
+* **【彻底修复 PhoneHttpServer 请求体读取挂起 Bug】**：
+  * 将 `handleConnectPeer` 重构为直接从已初始化的 `reader: BufferedReader` 读取字符流，杜绝与底层 `inputStream` 混用导致的数据丢失和挂起死锁；
+  * 正确解析并回传双方设备名、IP、端口与保存路径。
+* **【全网卡候选 IP 智能提取与多候选穿透握手】**：
+  * 在 `PhoneHttpServer.kt` 新增 `getAllLocalIpAddresses()`，优先识别提取热点网卡（`ap*`, `softap*`）、无线局域网（`wlan*`）及所有非回环真实局域网 IPv4；
+  * 二维码 Payload 中同时注入 `ip`（主 IP）与 `ips: [...]`（所有候选局域网 IP 列表）；
+  * 二维码弹窗可清晰展示当前本机检测到的所有网络地址（含热点及 WiFi）。
+* **【扫码端与手动连接的多 IP 极速探测并发/自动回退】**：
+  * 在 `NetworkManager.kt` 与 `MainActivity.kt` 中，扫码后解析候选 IP 列表，自动通过 `tryProbePhonePeer` 依次快速探测可用通道（2.5 秒连接超时，谁先通即刻锁定）；
+  * 若尝试 52020 端口未响应（如手动输入未带端口），自动静默向候选 IP 探测 52021 手机服务端口，平滑自适应电脑端与手机端。
+* **【版本与产物】**：
+  * `versionCode` 升级至 `9`，`versionName` 升级至 `"1.4.2"`。
+  * 产物输出路径：`bin/CrossTransfer.apk` 与 `bin/CrossTransfer_v1.4.2.apk`（6.8 MB）。
+
+---
+
 ## 📌 [v1.4.1] - 2026-10-10 23:25
 
 ### 1. 修改目的与问题排查

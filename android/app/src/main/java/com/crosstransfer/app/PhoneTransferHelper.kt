@@ -67,7 +67,12 @@ object PhoneTransferHelper {
         }
 
         val ip = server.getLocalIpAddress()
-        tvIp.text = "本机局域网地址: $ip:${server.port}"
+        val allIps = server.getAllLocalIpAddresses().filter { it != "127.0.0.1" }
+        tvIp.text = if (allIps.size > 1) {
+            "本机网络地址:\n" + allIps.joinToString("\n") { "$it:${server.port}" }
+        } else {
+            "本机局域网地址: $ip:${server.port}"
+        }
         val curPath = if (server.customSaveDir.isNotBlank()) {
             server.customSaveDir
         } else {

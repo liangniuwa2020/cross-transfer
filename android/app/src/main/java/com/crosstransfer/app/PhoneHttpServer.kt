@@ -77,46 +77,83 @@ class PhoneHttpServer(
         clientHandlers.clear()
     }
 
-    fun getLocalIpAddress(): String {
+    /**
+     * 获取本机所有可用的 IPv4 地址列表 (优先局域网 IP，如 WiFi、热点等)
+     */
+    fun getAllLocalIpAddresses(): List<String> {
+        val ips = linkedSetOf<String>()
+
+        // 1. 尝试从 WifiManager 获取
         try {
             val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             val wifiIp = wifiManager?.connectionInfo?.ipAddress ?: 0
             if (wifiIp != 0) {
-                return String.format(
+                val ipStr = String.format(
                     "%d.%d.%d.%d",
                     wifiIp and 0xff,
                     wifiIp shr 8 and 0xff,
                     wifiIp shr 16 and 0xff,
                     wifiIp shr 24 and 0xff
                 )
+                if (ipStr != "0.0.0.0" && ipStr != "127.0.0.1") {
+                    ips.add(ipStr)
+                }
             }
         } catch (_: Exception) {}
 
+        // 2. 遍历所有网络接口 (涵盖 wlan0, ap0 热点网卡, rndis0 等)
+        val hotspotIps = mutableListOf<String>()
+        val wlanIps = mutableListOf<String>()
+        val otherIps = mutableListOf<String>()
+
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
+            while (interfaces != null && interfaces.hasMoreElements()) {
                 val iface = interfaces.nextElement()
                 if (iface.isLoopback || !iface.isUp) continue
+                val name = iface.name.lowercase()
                 val addresses = iface.inetAddresses
                 while (addresses.hasMoreElements()) {
                     val addr = addresses.nextElement()
                     if (addr is Inet4Address && !addr.isLoopbackAddress) {
                         val ip = addr.hostAddress ?: ""
-                        if (!ip.startsWith("127.") && !ip.startsWith("169.254.")) {
-                            return ip
+                        if (ip.isNotBlank() && !ip.startsWith("127.") && !ip.startsWith("169.254.")) {
+                            when {
+                                name.contains("ap") || name.contains("softap") -> hotspotIps.add(ip)
+                                name.contains("wlan") -> wlanIps.add(ip)
+                                else -> otherIps.add(ip)
+                            }
                         }
                     }
                 }
             }
         } catch (_: Exception) {}
-        return "127.0.0.1"
+
+        // 按优先级汇总: 先热点(若开启热点)，后无线局域网，再其他
+        ips.addAll(hotspotIps)
+        ips.addAll(wlanIps)
+        ips.addAll(otherIps)
+
+        if (ips.isEmpty()) {
+            ips.add("127.0.0.1")
+        }
+        return ips.toList()
+    }
+
+    fun getLocalIpAddress(): String {
+        val all = getAllLocalIpAddresses()
+        return all.firstOrNull { it != "127.0.0.1" } ?: all.firstOrNull() ?: "127.0.0.1"
     }
 
     fun getQrPayload(): String {
-        val ip = getLocalIpAddress()
+        val allIps = getAllLocalIpAddresses()
+        val primaryIp = getLocalIpAddress()
         val json = JSONObject()
         json.put("type", "phone_server")
-        json.put("ip", ip)
+        json.put("ip", primaryIp)
+        val ipsArray = JSONArray()
+        allIps.forEach { ipsArray.put(it) }
+        json.put("ips", ipsArray)
         json.put("port", port)
         json.put("model", Build.MODEL)
         json.put("name", "${Build.BRAND} ${Build.MODEL}")
@@ -154,7 +191,7 @@ class PhoneHttpServer(
 
                 when {
                     path.startsWith("/api/info") -> handleApiInfo(outputStream!!)
-                    path.startsWith("/api/connect_peer") -> handleConnectPeer(headers, inputStream!!, outputStream!!)
+                    path.startsWith("/api/connect_peer") -> handleConnectPeer(headers, reader, outputStream!!)
                     path.startsWith("/api/disconnect_peer") -> handleDisconnectPeer(outputStream!!)
                     path.startsWith("/api/upload") -> handleUpload(headers, inputStream!!, outputStream!!)
                     path.startsWith("/api/list_directory") -> handleListDirectory(path, outputStream!!)
@@ -168,25 +205,27 @@ class PhoneHttpServer(
             }
         }
 
-        private fun handleConnectPeer(headers: Map<String, String>, input: InputStream, out: OutputStream) {
+        private fun handleConnectPeer(headers: Map<String, String>, reader: BufferedReader, out: OutputStream) {
             val length = headers["content-length"]?.toIntOrNull() ?: 0
             var clientIp = socket.inetAddress?.hostAddress ?: ""
             var clientPort = 52021
             var modelName = "安卓手机"
 
             if (length > 0) {
-                val bytes = ByteArray(length)
-                var read = 0
-                while (read < length) {
-                    val r = input.read(bytes, read, length - read)
+                val chars = CharArray(length)
+                var readTotal = 0
+                while (readTotal < length) {
+                    val r = reader.read(chars, readTotal, length - readTotal)
                     if (r == -1) break
-                    read += r
+                    readTotal += r
                 }
-                val bodyStr = String(bytes, Charsets.UTF_8)
+                val bodyStr = String(chars, 0, readTotal)
                 try {
                     val bodyJson = JSONObject(bodyStr)
                     val ip = bodyJson.optString("ip", "")
-                    if (ip.isNotEmpty()) clientIp = ip
+                    if (ip.isNotEmpty() && ip != "127.0.0.1") {
+                        clientIp = ip
+                    }
                     clientPort = bodyJson.optInt("port", 52021)
                     modelName = bodyJson.optString("name", bodyJson.optString("model", "安卓手机"))
                 } catch (_: Exception) {}

@@ -101,12 +101,16 @@ class NetworkManager(private val context: Context) {
         }
     }
 
-    fun connect(host: String, port: Int, pin: String = "") {
+    var candidateHosts: List<String> = emptyList()
+        private set
+
+    fun connect(host: String, port: Int, pin: String = "", candidateIps: List<String> = emptyList()) {
         autoReconnectEnabled = true
         reconnectAttempts = 0
         lastPin = pin
         serverHost = host
         serverPort = port
+        candidateHosts = if (candidateIps.isNotEmpty()) candidateIps else listOf(host)
         internalConnect(host, port, pin)
     }
 
@@ -115,7 +119,7 @@ class NetworkManager(private val context: Context) {
 
         // 如果端口是手机服务端端口(52021)，优先使用对等安卓互联握手协议
         if (port == 52021) {
-            connectPhonePeer(host, port)
+            connectPhonePeer(candidateHosts.ifEmpty { listOf(host) }, port)
             return
         }
 
@@ -227,6 +231,24 @@ class NetworkManager(private val context: Context) {
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 isConnected = false
                 mainHandler.removeCallbacks(appPingRunnable)
+
+                // 如果尝试连接 52020 失败，且对端可能是手机时，自动回退探测 52021 (手机服务端端口)
+                if (serverPort == 52020) {
+                    Thread {
+                        val connectedToPhone = tryProbePhonePeer(candidateHosts.ifEmpty { listOf(host) }, 52021)
+                        if (!connectedToPhone) {
+                            if (autoReconnectEnabled) {
+                                scheduleReconnect("连接中断，正在自动恢复...")
+                            } else {
+                                mainHandler.post {
+                                    listener?.onDisconnected("连接失败: ${t.localizedMessage ?: "无法连接到设备"}")
+                                }
+                            }
+                        }
+                    }.start()
+                    return
+                }
+
                 if (autoReconnectEnabled) {
                     scheduleReconnect("连接中断，正在自动恢复...")
                 } else {
@@ -238,48 +260,68 @@ class NetworkManager(private val context: Context) {
         })
     }
 
-    private fun connectPhonePeer(host: String, port: Int) {
-        Thread {
+    private fun tryProbePhonePeer(hosts: List<String>, port: Int): Boolean {
+        val quickClient = client.newBuilder()
+            .connectTimeout(2500, TimeUnit.MILLISECONDS)
+            .readTimeout(3000, TimeUnit.MILLISECONDS)
+            .build()
+
+        val myIp = try {
+            PhoneHttpServer(context).getLocalIpAddress()
+        } catch (_: Exception) { "" }
+
+        val payload = JSONObject().apply {
+            put("type", "phone_client")
+            put("model", Build.MODEL)
+            put("brand", Build.BRAND)
+            put("name", "${Build.BRAND} ${Build.MODEL}")
+            put("ip", myIp)
+            put("port", 52021)
+        }
+        val body = RequestBody.create("application/json; charset=utf-8".toMediaTypeOrNull(), payload.toString())
+
+        for (targetHost in hosts) {
+            if (targetHost.isBlank() || targetHost == "127.0.0.1") continue
             try {
-                // 向对端安卓机发送握手
-                val payload = JSONObject().apply {
-                    put("type", "phone_client")
-                    put("model", Build.MODEL)
-                    put("brand", Build.BRAND)
-                    put("name", "${Build.BRAND} ${Build.MODEL}")
-                    put("ip", "")
-                    put("port", 52021)
-                }
-                val body = RequestBody.create("application/json; charset=utf-8".toMediaTypeOrNull(), payload.toString())
                 val req = Request.Builder()
-                    .url("http://$host:$port/api/connect_peer")
+                    .url("http://$targetHost:$port/api/connect_peer")
                     .post(body)
                     .build()
-
-                val resp = client.newCall(req).execute()
+                val resp = quickClient.newCall(req).execute()
                 if (resp.isSuccessful) {
                     val respStr = resp.body?.string() ?: "{}"
+                    resp.close()
                     val respJson = JSONObject(respStr)
                     val peerName = respJson.optString("name", respJson.optString("model", "安卓对端手机"))
+                    serverHost = targetHost
+                    serverPort = port
                     isConnected = true
                     isPhonePeer = true
                     reconnectAttempts = 0
                     mainHandler.removeCallbacks(appPingRunnable)
                     mainHandler.post(appPingRunnable)
                     mainHandler.post {
-                        listener?.onConnected(peerName, host, port)
+                        listener?.onConnected(peerName, targetHost, port)
                     }
-                } else {
-                    mainHandler.post {
-                        listener?.onDisconnected("对端手机拒绝连接 (HTTP ${resp.code})")
-                    }
+                    return true
                 }
-            } catch (e: Exception) {
+                resp.close()
+            } catch (_: Exception) {
+                // 尝试下一个候选 IP
+            }
+        }
+        return false
+    }
+
+    private fun connectPhonePeer(hosts: List<String>, port: Int) {
+        Thread {
+            val success = tryProbePhonePeer(hosts, port)
+            if (!success) {
                 if (autoReconnectEnabled) {
                     scheduleReconnect("连接对端手机失败，正在尝试重连...")
                 } else {
                     mainHandler.post {
-                        listener?.onDisconnected("连接对端手机失败: ${e.localizedMessage ?: "网络超时"}")
+                        listener?.onDisconnected("连接对端手机失败: 无法连接到 ${hosts.joinToString("/")}:$port")
                     }
                 }
             }
