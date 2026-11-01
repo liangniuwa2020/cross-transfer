@@ -25,3 +25,6 @@ android/*.iml
 Thumbs.db
 .vscode/
 .idea/
+
+# 旧版 PC 程序备份目录（回滚用，不入库）
+bin/CrossTransfer_PC_v*/

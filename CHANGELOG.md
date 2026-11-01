@@ -4,6 +4,96 @@
 
 ---
 
+## 📌 [v1.5.0] - 2026-11-02 00:10
+
+### 1. 修改目的与问题排查
+* 针对用户反馈的核心痛点：“**连接以后很容易断连，使用起来流畅性和易用性也不舒服**”，做一次系统性的稳定性与体验重构。
+* **根本原因深度剖析**：
+  1. **【旧连接迟到回调打死新连接（"刚连上就断"的头号根因）】**：`NetworkManager.internalConnect` 每次重连都新建 `OkHttpClient` + `WebSocket`，但旧 socket 的 `onClosed` / `onFailure` 回调没有任何身份校验。旧连接在重连后 1~3 秒才超时回调，此时 `isConnected` 已被新连接置为 true，回调却照样执行 `disconnect()` 并把界面打回未连接态——表现就是"扫码成功后闪一下就断"。
+  2. **【心跳一次失败即判定掉线】**：`appPingRunnable` 只保留单次探测，任何一次 WiFi 抖动/AP 切换/Doze 降频都直接 `disconnect()`，没有容错窗口。
+  3. **【心跳定时器在断连后永久停摆】**：旧代码把 `mainHandler.postDelayed(this, 10000)` 写在 `if (isConnected)` 分支内部，一旦掉线就再也不会重新调度心跳，之后即使网络恢复也无人探测、无人回连。
+  4. **【重连退避无上限】**：旧版 2s/4s/8s 之后继续按 8s 无限重连，长时间离线时后台线程持续唤醒，耗电且加剧系统杀后台。
+  5. **【WakeLock 只有 1 小时且随 Activity 生命周期漂移】**：`wakeLock?.acquire(3600*1000L)` 挂在 `MainActivity.onCreate`，一小时到期后锁自动释放，长传输必被系统冻结；旋转屏幕重建 Activity 还会误杀服务与连接。
+  6. **【PC 端没有断线对账机制】**：PC 页面只靠 WebSocket 推送，一旦 ws 断掉而手机还在线，界面会一直显示"未连接"，用户以为连接失败；反之 ws 重连成功后也补不回断线期间错过的 `phone_connected` 事件。
+  7. **【PC 端固定 2 秒重连】**：`ws.onclose = () => setTimeout(initWebSocket, 2000)` 在服务端重启或端口被占时会以 2 秒间隔无限打点，浏览器主线程和 CPU 持续抖动。
+  8. **【/api/upload 完全忽略 X-Target-Dir】**：手机端明明用 `URLEncoder.encode(targetDir)` 发了目标目录头，PC 端 `/api/upload` 却只写死 `DOWNLOADS_DIR`，导致"上传到手机当前文件夹"在电脑接收方向上失效。
+  9. **【发送文件夹时 zip 打包阻塞事件循环】**：`/api/send_local_folder` 在大目录上同步跑 `zipfile` 压缩，整个 FastAPI 事件循环被卡住数秒到数十秒，期间所有 WebSocket 心跳与 HTTP 请求全部超时——这本身就会被误判成"断连"。
+  10. **【WS 无接收超时 + 广播无写超时】**：半开连接（对端掉电、WiFi 断开）时 `websocket.receive_text()` 永久挂起，连接槽位不释放；`broadcast_to_browsers` 里一个卡死的慢客户端能拖住整个广播循环。
+  11. **【传输并发无上限】**：多文件批量发送时每个文件起一个 Thread 且不限并发，几十个大文件会瞬间打满线程与带宽，互相抢流导致每个都慢、进度条乱跳。
+  12. **【缺传输进度上报与剩余时间】**：手机端只有百分比和瞬时速度，没有 ETA；PC 端批量发送时只有一个文件一个文件的进度，没有总体进度。
+
+### 2. 具体修复与架构防断优化
+* **【Android 端 · 连接代际号（connectionEpoch）】**：
+  * `NetworkManager.kt` 新增 `private val connectionEpoch = AtomicInteger(0)`，每次 `internalConnect` 自增并捕获 `myEpoch`；
+  * 所有 `onOpen` / `onClosed` / `onFailure` / `onMessage` 回调首行统一 `if (connectionEpoch.get() != myEpoch) return`，彻底杜绝旧连接迟到回调打断新连接；
+  * `closeWebSocketInternal()` 改为返回新代际号，`tryProbePhonePeer` / `connectPhonePeer` 增加 `epoch` 参数并在候选 IP 轮询中校验。
+* **【Android 端 · 心跳容错与自愈】**：
+  * `appPingRunnable` 重写：`mainHandler.postDelayed(this, 8000)` 移入 `finally` 块**无条件重排**，断连后心跳永不停止；间隔 10s → 8s；
+  * `consecutivePingFailures` 连续失败计数（≥3 次才判掉线）；
+  * `client` 增加 `.pingInterval(20, TimeUnit.SECONDS)` 用底层 Ping 帧兜底半开连接（`readTimeout=0` 时只有 Ping 帧能触发 `onFailure`）；
+  * 连接超时 15s → 10s，心跳 client 超时 5s → 4s，缩短"卡住"的观感。
+* **【Android 端 · 智能重连】**：
+  * `scheduleReconnect` 退避改为分档：`≤2 次 → 1s`、`≤5 → 2.5s`、`≤10 → 5s`、`≤20 → 10s`、`>20 → 15s`；
+  * 新增 `registerNetworkCallback()` / `unregisterNetworkCallback()` / `cancelPendingReconnect()`，监听 `ConnectivityManager.NetworkCallback.onAvailable`，网络一恢复立刻重连并重置 `reconnectAttempts`，不再干等退避计时。
+* **【Android 端 · 前台服务保活】**：
+  * 新增 `TransferForegroundService.kt`（约 190 行）：`START_STICKY` + `startForeground(..., FOREGROUND_SERVICE_TYPE_DATA_SYNC)`，常驻通知栏提示当前传输状态；
+  * WakeLock 改为 `wakeLock?.acquire()` **无限期**（不再 1 小时到期），WifiLock 保持 `WIFI_MODE_FULL_LOW_LATENCY`（Q+）/ `WIFI_MODE_FULL_HIGH_PERF`；
+  * `AndroidManifest.xml` 新增 `FOREGROUND_SERVICE`、`FOREGROUND_SERVICE_DATA_SYNC`、`POST_NOTIFICATIONS` 权限与 `<service android:name=".TransferForegroundService" android:foregroundServiceType="dataSync" />`；
+  * `MainActivity.onDestroy` 改为仅在 `isFinishing` 时停服务/停 HTTP server/断开连接，**旋转屏幕不再误杀连接**。
+* **【Android 端 · 传输并发与体验】**：
+  * `NetworkManager.kt` 新增 `private val transferSlots = Semaphore(3)`，`sendFileDirect` / `sendFile` / `downloadFile` 统一 `acquire()` + `finally { release() }`，最多 3 路并发，避免线程爆炸与带宽互抢；
+  * `MainActivity.onFileTransferProgress` 增强：百分比 `coerceIn(0,100)`、速度为 0 时显示 `-- MB/s`、**新增 ETA 剩余时间**（`即将完成` / `剩余 N秒` / `剩余 M分S秒` / `剩余 H小时M分`）；
+  * 新增 `updateConnectingUi(target)` / `clearConnectingUi()`：点击扫码或手动连接后立即显示琥珀色 #F59E0B 状态点并禁用重复点击，替代原来"文字改了但看不出在连"。
+* **【PC 端 · WebSocket 健壮性】**：
+  * `server.py` 的 `/ws` 重写：`RECV_TIMEOUT = 90.0` + `asyncio.wait_for(websocket.receive_text(), ...)`，超时主动 `close(code=1001, reason="heartbeat timeout")`；清理逻辑移入 `finally`，连接槽位一定释放；
+  * `broadcast_to_browsers` / `notify_android_clients` 每次发送包 `asyncio.wait_for(timeout=3.0 / 5.0)`，慢客户端不再拖死广播循环；
+  * uvicorn `ws_ping_interval` 10 → 20、`ws_ping_timeout` 60 → 90，与手机端 8s 应用层心跳错开，消除双心跳竞争；
+  * 新增 `action == "transfer_progress"` 分支，把手机端进度转发给浏览器。
+* **【PC 端 · 状态对账与指数退避】**：
+  * `app.js` 新增 `nextReconnectDelay()`：`[1000, 2000, 4000, 8000]` 指数退避封顶，替代固定 2s 无限重连；
+  * 新增 `setWsUiState(state)`：头部指示灯 `#wsStateDot` + 文案 `#wsStateLabel` 三态显示（已连接 / 正在连接 / 连接中断，正在恢复），用户能直接看出是本机服务问题还是手机问题；
+  * 新增 `syncStatusOnce()` + `startStatusPolling()`（8s 一次拉 `/api/status` 对账）+ `visibilitychange` 监听（页面重新可见时若 ws 已断则立即重连），彻底解决"手机在线但页面显示未连接"；
+  * ws 重连成功后立即 `syncStatusOnce()`，补回断线期间错过的 `phone_connected`。
+* **【PC 端 · 上传目标目录真正生效】**：
+  * `/api/upload` 签名改为 `upload_file(request: Request, file: UploadFile = File(...), target_dir: str = Form(default=""))`；
+  * 目标目录优先级：表单 `target_dir` > 请求头 `X-Target-Dir` > 默认下载目录，并统一 `urllib.parse.unquote`；
+  * 新增 `_safe_target_dir(raw)` 校验：必须是绝对路径、自动 `mkdir`、`os.access(W_OK)` 校验可写，非法路径安全回退到默认目录。
+* **【PC 端 · 性能与资源治理】**：
+  * `/api/send_local_folder` 的 zip 打包改为 `await asyncio.get_event_loop().run_in_executor(None, _build_zip)`，不再阻塞事件循环（这是"发大文件夹时整体假死"的根因）；
+  * `staged_files` 改 `OrderedDict` + `STAGED_FILES_LIMIT = 200` + `_prune_staged_files()`，历史记录 `HISTORY_LIMIT = 200`，临时目录启动时 `_cleanup_temp_send_dir()` 清理，长期运行不再无限涨内存/占盘。
+* **【PC 端 · 新增运维接口】**：`GET /api/ping`（含 version）、`GET /api/status`（phones / browsers / history / in_progress / version），供页面轮询对账与外部健康检查。
+* **【PC 端 · 批量进度】**：`sendBatchFiles` 增加累计字节 + 平均速度的总进度，进度条显示 `批量发送 i/total 个文件 · 总进度 N%`。
+* **【PC 端 · 启动可靠性】**：`main.py` 改为轮询 `/api/ping` 等到服务真正就绪（最长 15s）再开窗口，替代原来盲 `sleep(1.0)`；版本号与端口统一从 `server.py` 的 `APP_VERSION` / `SERVER_PORT` 取，避免两处硬编码漂移。
+* **【版本与产物】**：
+  * `versionCode` 由 `10` 升级至 `11`，`versionName` 由 `"1.4.3"` 升级至 `"1.5.0"`；PC 端界面徽标同步为 `v1.5.0 桌面端`。
+  * 重新编译生成 `bin/CrossTransfer_v1.5.0.apk`（别名 `bin/CrossTransfer.apk`）与 `bin/CrossTransfer_PC/CrossTransfer_PC.exe`（13.4 MB，onedir）。
+
+### 3. 修改涉及的文件清单
+* `android/app/src/main/java/com/crosstransfer/app/NetworkManager.kt`：连接代际号、心跳 finally 重排、指数退避、网络回调重连、传输并发信号量、Ping 帧兜底。
+* `android/app/src/main/java/com/crosstransfer/app/TransferForegroundService.kt`：**新增**，前台数据同步服务 + 无限期 WakeLock/WifiLock。
+* `android/app/src/main/java/com/crosstransfer/app/MainActivity.kt`：前台服务启停、通知权限、连接中状态 UI、ETA 剩余时间、`onDestroy` 仅在 `isFinishing` 时收尾。
+* `android/app/src/main/AndroidManifest.xml`：新增前台服务与通知权限、注册 `TransferForegroundService`。
+* `android/app/build.gradle`：`versionCode 11`、`versionName "1.5.0"`。
+* `pc/server.py`：`APP_VERSION`/`SERVER_PORT` 常量、`/api/ping`、`/api/status`、`/api/upload` 支持 `X-Target-Dir`、`_safe_target_dir`、zip 打包移出事件循环、WS 接收超时与 finally 清理、广播写超时、`transfer_progress` 转发、staged/history 上限与临时目录清理。
+* `pc/main.py`：服务就绪轮询替代盲 sleep、版本与端口从 server 取、心跳参数对齐。
+* `pc/static/app.js`：指数退避重连、ws 三态指示灯、`syncStatusOnce` 状态对账与 8s 轮询、`visibilitychange` 重连、批量总进度、`transfer_progress` 渲染。
+* `pc/static/index.html`：版本徽标 `v1.5.0`，状态指示灯增加 `wsStateDot` / `wsStateLabel` id。
+* `pc/CrossTransfer_PC.spec`：保持 onedir 打包配置，hiddenimports 覆盖 webview / pythonnet / qrcode / PIL / psutil。
+
+### 4. 本次编译输出产物
+* **Android 安装包**：[`bin/CrossTransfer_v1.5.0.apk`](file:///E:/Antigravity%20ex_project/cross-transfer/bin/CrossTransfer_v1.5.0.apk)（别名：[`bin/CrossTransfer.apk`](file:///E:/Antigravity%20ex_project/cross-transfer/bin/CrossTransfer.apk)，6.5 MB，versionCode 11）
+* **Windows PC 程序**：[`bin/CrossTransfer_PC/CrossTransfer_PC.exe`](file:///E:/Antigravity%20ex_project/cross-transfer/bin/CrossTransfer_PC/CrossTransfer_PC.exe)（13.4 MB，onedir，内嵌静态资源 `_internal/static`）
+* **旧版备份**：`bin/CrossTransfer_PC_v1.4.3/`（v1.4.3 的 exe 目录整体保留，便于回滚）
+
+### 5. 联调验证记录
+* **PC 端（打包后 exe 实测）**：`GET /api/ping` → `{"status":"pong",...,"version":"1.5.0"}`；`GET /api/status` → `{"connected_phones":0,"browsers":1,...,"version":"1.5.0"}`；`GET /` → 200 且含 `wsStateDot`；`GET /app.js` → 60571 字节且含 `setWsUiState`。
+* **WebSocket 全链路（对打包 exe）**：browser 发 `ping` 收 `pong`；android 连入后 browser 收到 `phone_connected`（`count:1`），android 收到 `device_info`；android 断开后 browser 收到 `phone_disconnected`（`count:0`）。
+* **`/api/upload` 的 X-Target-Dir**：手工构造 multipart + 中文目标目录 → 200，文件落到指定目录、大小一致、内容一致、**无 boundary 泄漏**。
+* **multipart 解析器移植验证**：把 `PhoneHttpServer.saveMultipartUpload` 的边界算法逐行移植到 Python，用 1/2/3/7/64/1024/65536/131072 字节分块喂 9 个用例（空文件、单字节、大量 CRLF、大量连字符、近似 boundary、1KB 随机、300KB 随机、含 emoji 的 UTF-8 文本）→ **failures = 0**。
+* **Android 端**：`assembleDebug` 与 `assembleRelease` 均 `BUILD SUCCESSFUL`，`aapt2 dump badging` 确认 `versionCode='11' versionName='1.5.0'`。
+
+---
+
 ## 📌 [v1.4.3] - 2026-10-12 12:15
 
 ### 1. 修改目的与问题排查

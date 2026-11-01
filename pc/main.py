@@ -10,9 +10,9 @@ from pathlib import Path
 base_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(base_dir))
 
-from server import app
+from server import app, SERVER_PORT, APP_VERSION
 
-PORT = 52020
+PORT = SERVER_PORT
 
 class DesktopApi:
     """Desktop native API exposed to webview JavaScript."""
@@ -52,21 +52,38 @@ def run_server():
         port=PORT,
         log_level="warning",
         timeout_keep_alive=3600,
-        ws_ping_interval=10.0,
-        ws_ping_timeout=60.0
+        ws_ping_interval=20.0,
+        ws_ping_timeout=90.0
     )
+
+def _wait_for_server(timeout=15.0):
+    """Wait until the local HTTP service actually answers."""
+    import urllib.request
+    deadline = time.time() + timeout
+    probe = f"http://127.0.0.1:{PORT}/api/ping"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(probe, timeout=1.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
 
 def main():
     print("=" * 60)
     print("       跨屏快传 CrossTransfer - Windows PC 桌面端")
-    print("       服务启动中，端口: 52020")
+    print(f"       版本 v{APP_VERSION}   服务端口: {PORT}")
     print("=" * 60)
 
     # Start FastAPI server in daemon thread
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
 
-    time.sleep(1.0)
+    if not _wait_for_server(15.0):
+        print("[!] 本地服务启动超时，仍尝试打开窗口...")
+
     url = f"http://127.0.0.1:{PORT}/"
     api = DesktopApi()
 

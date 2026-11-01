@@ -98,27 +98,32 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
         // 保持屏幕常亮
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // 保持后台运行与 WiFi 高性能低延迟，防止休眠断开 Socket
-        try {
-            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
-            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CrossTransfer::WakeLock")
-            wakeLock?.acquire(3600 * 1000L) // 保持 1 小时
-        } catch (_: Exception) {}
-
-        try {
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "CrossTransfer::WifiLock")
-            } else {
-                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "CrossTransfer::WifiLock")
-            }
-            wifiLock?.acquire()
-        } catch (_: Exception) {}
+        // 关键修复: 改用前台服务持有 WakeLock/WifiLock（无限期、可续活），
+        // 不再在 Activity 里申请 1 小时后自动失效的锁 —— 那正是"连上一会儿就断"的主因。
+        startForegroundServiceSafely()
+        requestNotificationPermissionIfNeeded()
 
         setupRecyclerView()
         setupListeners()
         updateSaveDirDisplay()
         updateConnectionUi(false, "未连接设备", "")
+    }
+
+    private fun startForegroundServiceSafely() {
+        try {
+            TransferForegroundService.start(this)
+        } catch (_: Exception) {}
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        try {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 5201)
+            }
+        } catch (_: Exception) {}
     }
 
     private fun setupRecyclerView() {
@@ -162,7 +167,7 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
                 // 默认尝试电脑端口 52020，失败时 NetworkManager 会自动探测手机端口 52021
                 port = 52020
             }
-            binding.tvConnectionStatus.text = "正在连接 $host:$port ..."
+            updateConnectingUi("$host:$port")
             networkManager.connect(host, port, candidateIps = listOf(host))
         }
 
@@ -302,7 +307,7 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
 
             if (host.isNotEmpty()) {
                 val tipName = if (targetModel.isNotEmpty()) targetModel else "$host:$port"
-                binding.tvConnectionStatus.text = "正在连接设备 $tipName ..."
+                updateConnectingUi(tipName)
                 networkManager.connect(host, port, pin, candidateIps)
             } else {
                 Toast.makeText(this, "无效的二维码内容", Toast.LENGTH_SHORT).show()
@@ -353,6 +358,30 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
         updateStorageBanner()
     }
 
+    /**
+     * 连接中的过渡态：把状态点变成琥珀色并禁用扫码按钮，避免用户以为卡死而重复点击，
+     * 也避免多个连接任务互相打架（重复点击是"连上就断"的常见人为诱因）。
+     */
+    private fun updateConnectingUi(target: String) {
+        binding.tvConnectionStatus.text = "🟡 正在连接 $target ..."
+        binding.tvPcAddress.text = "正在握手，请稍候（首次连接约 1-3 秒）"
+        val dot = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.parseColor("#F59E0B"))
+        }
+        binding.viewStatusDot.background = dot
+        binding.tvDisconnect.visibility = View.VISIBLE
+        binding.layoutConnectedActions.visibility = View.GONE
+        binding.layoutManualConnect.visibility = View.GONE
+        binding.btnScanQr.isEnabled = false
+        binding.btnScanQr.alpha = 0.6f
+    }
+
+    private fun clearConnectingUi() {
+        binding.btnScanQr.isEnabled = true
+        binding.btnScanQr.alpha = 1.0f
+    }
+
     override fun onResume() {
         super.onResume()
         updateStorageBanner()
@@ -399,12 +428,14 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
     // --- NetworkManager.ConnectionListener (客户端主动连接时的回调) ---
 
     override fun onConnected(serverName: String, host: String, port: Int) {
+        clearConnectingUi()
         val typeName = if (serverName.isNotBlank() && serverName != "Windows PC") serverName else if (port == 52021) "安卓对端手机" else serverName
         updateConnectionUi(true, "🟢 已连接到: $typeName", "设备地址: $host:$port (连接正常)")
         Toast.makeText(this, "已成功互联设备: $typeName", Toast.LENGTH_SHORT).show()
     }
 
     override fun onDisconnected(reason: String) {
+        clearConnectingUi()
         updateConnectionUi(false, "🔴 未连接对端设备 ($reason)", "请点击右上角扫码连接电脑或对端手机")
     }
 
@@ -421,16 +452,31 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
 
     override fun onFileTransferProgress(transferredBytes: Long, totalBytes: Long, speedBps: Long) {
         runOnUiThread {
-            val percent = if (totalBytes > 0) ((transferredBytes * 100) / totalBytes).toInt() else 0
+            val percent = if (totalBytes > 0) ((transferredBytes * 100) / totalBytes).toInt().coerceIn(0, 100) else 0
             binding.progressBar.progress = percent
             binding.tvTransferPercent.text = "$percent%"
 
             val speedMb = speedBps.toDouble() / (1024 * 1024)
-            val speedStr = String.format("%.2f MB/s", speedMb)
+            val speedStr = if (speedBps > 0) String.format("%.2f MB/s", speedMb) else "-- MB/s"
             val transferredMb = transferredBytes.toDouble() / (1024 * 1024)
             val totalMb = totalBytes.toDouble() / (1024 * 1024)
 
-            binding.tvTransferSpeed.text = String.format("速度: %s • 已传输: %.1f MB / %.1f MB", speedStr, transferredMb, totalMb)
+            // 剩余时间预估：速度有效且还有剩余字节时才算，否则不显示，避免显示无意义的巨大值
+            val etaStr = if (speedBps > 1024 && totalBytes > transferredBytes) {
+                val remainSec = (totalBytes - transferredBytes) / speedBps
+                when {
+                    remainSec < 1 -> "即将完成"
+                    remainSec < 60 -> "剩余 ${remainSec}秒"
+                    remainSec < 3600 -> "剩余 ${remainSec / 60}分${remainSec % 60}秒"
+                    else -> "剩余 ${remainSec / 3600}小时${(remainSec % 3600) / 60}分"
+                }
+            } else ""
+
+            binding.tvTransferSpeed.text = if (etaStr.isEmpty()) {
+                String.format("速度: %s • 已传输: %.1f MB / %.1f MB", speedStr, transferredMb, totalMb)
+            } else {
+                String.format("速度: %s • %.1f / %.1f MB • %s", speedStr, transferredMb, totalMb, etaStr)
+            }
         }
     }
 
@@ -501,13 +547,17 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
 
     override fun onDestroy() {
         super.onDestroy()
-        try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-        } catch (_: Exception) {}
-        try {
-            if (wifiLock?.isHeld == true) wifiLock?.release()
-        } catch (_: Exception) {}
-        phoneHttpServer.stop()
-        networkManager.disconnect("应用关闭")
+        // 锁已由前台服务统一持有与释放，这里只需确保服务同步收尾
+        if (isFinishing) {
+            try {
+                TransferForegroundService.stop(this)
+            } catch (_: Exception) {}
+            try {
+                phoneHttpServer.stop()
+            } catch (_: Exception) {}
+            try {
+                networkManager.disconnect("应用关闭")
+            } catch (_: Exception) {}
+        }
     }
 }

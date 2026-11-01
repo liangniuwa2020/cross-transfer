@@ -9,13 +9,22 @@ import org.json.JSONObject
 import java.io.*
 import java.net.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 手机内置极速文件传输 HTTP/WebSocket 服务端 (用于手机与手机互联互传)
+ * 手机内置极速文件传输 HTTP 服务端 (用于手机与手机互联互传)
  * - 监听本地指定端口 (默认 52021)
  * - 提供本机二维码信息 /api/info
- * - 接收对端安卓机上传的文件并保存到用户任意指定的文件夹 (/api/upload, /api/upload_direct)
- * - 支持 WebSocket 实时双向进度/目录同步 (/ws)
+ * - 接收对端安卓机上传的文件并保存到用户任意指定的文件夹 (/api/upload)
+ * - 支持目录浏览 /api/list_directory 与心跳 /api/ping
+ *
+ * v1.5.0 关键修复:
+ * 1) 请求头改为直接按字节解析，不再用 BufferedReader —— 原先 BufferedReader 会把
+ *    body 的前若干字节预读进自己的缓冲区，导致随后从裸 InputStream 读 body 时丢失开头字节，
+ *    大文件必然损坏（这是"传输经常失败/文件打不开"的根因）。
+ * 2) multipart 解析重写为按 boundary 流式截断 —— 原先会把结尾的 `\r\n--boundary--\r\n`
+ *    一并写进文件，并错误地用整体 Content-Length 判断结束。
+ * 3) 每个连接设置读超时，避免半开连接长期占用线程。
  */
 class PhoneHttpServer(
     private val context: Context,
@@ -35,26 +44,33 @@ class PhoneHttpServer(
     var customSaveDir: String = ""
 
     private var serverSocket: ServerSocket? = null
+
     @Volatile
     private var isRunning = false
     private val clientHandlers = ConcurrentHashMap<String, ClientConnection>()
+    private val connSeq = AtomicInteger(0)
 
     fun start() {
         if (isRunning) return
         isRunning = true
         Thread {
             try {
-                serverSocket = ServerSocket(port)
+                val ss = ServerSocket()
+                ss.reuseAddress = true
+                ss.bind(InetSocketAddress(port))
+                serverSocket = ss
                 val ip = getLocalIpAddress()
                 listener?.onServerStarted(ip, port)
 
                 while (isRunning) {
                     try {
-                        val socket = serverSocket?.accept() ?: break
-                        val connId = "${socket.inetAddress.hostAddress}:${socket.port}"
+                        val socket = ss.accept() ?: break
+                        socket.tcpNoDelay = true
+                        socket.soTimeout = 60_000
+                        val connId = "c${connSeq.incrementAndGet()}@${socket.inetAddress.hostAddress}"
                         val handler = ClientConnection(socket, connId)
                         clientHandlers[connId] = handler
-                        Thread(handler).start()
+                        Thread(handler, "ct-conn-$connId").start()
                     } catch (e: Exception) {
                         if (!isRunning) break
                     }
@@ -169,31 +185,51 @@ class PhoneHttpServer(
 
         override fun run() {
             try {
-                inputStream = socket.getInputStream()
+                val input = BufferedInputStream(socket.getInputStream(), 64 * 1024)
+                inputStream = input
                 outputStream = socket.getOutputStream()
-                val reader = BufferedReader(InputStreamReader(inputStream!!, "UTF-8"))
 
-                val requestLine = reader.readLine() ?: return
-                val parts = requestLine.split(" ")
+                // 逐字节读取请求头，直到 \r\n\r\n —— 绝不越过 body 起点
+                val headerBytes = ByteArrayOutputStream(2048)
+                var state = 0
+                var b = input.read()
+                while (b != -1) {
+                    headerBytes.write(b)
+                    state = when {
+                        (state == 0 || state == 2) && b == '\r'.code -> state + 1
+                        (state == 1 || state == 3) && b == '\n'.code -> state + 1
+                        b == '\r'.code -> 1
+                        else -> 0
+                    }
+                    if (state == 4) break
+                    b = input.read()
+                }
+                if (state != 4) return
+
+                val headerText = String(headerBytes.toByteArray(), Charsets.ISO_8859_1)
+                val lines = headerText.split("\r\n")
+                if (lines.isEmpty()) return
+
+                val parts = lines[0].split(" ")
                 if (parts.size < 2) return
                 val method = parts[0].uppercase()
                 val path = parts[1]
 
                 val headers = mutableMapOf<String, String>()
-                var line = reader.readLine()
-                while (!line.isNullOrBlank()) {
+                for (i in 1 until lines.size) {
+                    val line = lines[i]
+                    if (line.isBlank()) continue
                     val colon = line.indexOf(':')
-                    if (colon != -1) {
+                    if (colon > 0) {
                         headers[line.substring(0, colon).trim().lowercase()] = line.substring(colon + 1).trim()
                     }
-                    line = reader.readLine()
                 }
 
                 when {
                     path.startsWith("/api/info") -> handleApiInfo(outputStream!!)
-                    path.startsWith("/api/connect_peer") -> handleConnectPeer(headers, reader, outputStream!!)
+                    path.startsWith("/api/connect_peer") -> handleConnectPeer(headers, input, outputStream!!)
                     path.startsWith("/api/disconnect_peer") -> handleDisconnectPeer(outputStream!!)
-                    path.startsWith("/api/upload") -> handleUpload(headers, inputStream!!, outputStream!!)
+                    path.startsWith("/api/upload") -> handleUpload(headers, input, outputStream!!)
                     path.startsWith("/api/list_directory") -> handleListDirectory(path, outputStream!!)
                     path.startsWith("/api/ping") -> handlePing(outputStream!!)
                     else -> sendResponse(outputStream!!, 404, "text/plain", "Not Found")
@@ -205,23 +241,27 @@ class PhoneHttpServer(
             }
         }
 
-        private fun handleConnectPeer(headers: Map<String, String>, reader: BufferedReader, out: OutputStream) {
+        private fun readBody(input: InputStream, length: Int): String {
+            if (length <= 0) return ""
+            val buf = ByteArray(length)
+            var readTotal = 0
+            while (readTotal < length) {
+                val r = input.read(buf, readTotal, length - readTotal)
+                if (r == -1) break
+                readTotal += r
+            }
+            return String(buf, 0, readTotal, Charsets.UTF_8)
+        }
+
+        private fun handleConnectPeer(headers: Map<String, String>, input: InputStream, out: OutputStream) {
             val length = headers["content-length"]?.toIntOrNull() ?: 0
             var clientIp = socket.inetAddress?.hostAddress ?: ""
             var clientPort = 52021
             var modelName = "安卓手机"
 
             if (length > 0) {
-                val chars = CharArray(length)
-                var readTotal = 0
-                while (readTotal < length) {
-                    val r = reader.read(chars, readTotal, length - readTotal)
-                    if (r == -1) break
-                    readTotal += r
-                }
-                val bodyStr = String(chars, 0, readTotal)
                 try {
-                    val bodyJson = JSONObject(bodyStr)
+                    val bodyJson = JSONObject(readBody(input, length))
                     val ip = bodyJson.optString("ip", "")
                     if (ip.isNotEmpty() && ip != "127.0.0.1") {
                         clientIp = ip
@@ -329,11 +369,11 @@ class PhoneHttpServer(
             val contentType = headers["content-type"] ?: ""
             val contentLength = headers["content-length"]?.toLongOrNull() ?: 0L
 
-            var fileName = headers["x-file-name"]?.let {
+            val fileName = headers["x-file-name"]?.let {
                 try { URLDecoder.decode(it, "UTF-8") } catch (_: Exception) { it }
             } ?: "received_file"
 
-            var targetDirPath = headers["x-target-dir"]?.let {
+            val targetDirPath = headers["x-target-dir"]?.let {
                 try { URLDecoder.decode(it, "UTF-8") } catch (_: Exception) { it }
             } ?: ""
 
@@ -356,11 +396,28 @@ class PhoneHttpServer(
 
             // 处理 multipart/form-data 或 raw binary octet-stream
             if (contentType.contains("multipart/form-data")) {
-                val boundary = contentType.substringAfter("boundary=").trim()
-                saveMultipartUpload(input, boundary, contentLength, destDir, out)
+                val boundary = contentType.substringAfter("boundary=").trim().trim('"')
+                saveMultipartUpload(input, boundary, contentLength, destDir, fileName, out)
             } else {
                 saveRawUpload(input, fileName, contentLength, destDir, out)
             }
+        }
+
+        private fun uniqueTarget(destDir: File, fileName: String): File {
+            var targetFile = File(destDir, fileName)
+            var counter = 1
+            while (targetFile.exists()) {
+                val dot = fileName.lastIndexOf('.')
+                targetFile = if (dot > 0) {
+                    val base = fileName.substring(0, dot)
+                    val ext = fileName.substring(dot)
+                    File(destDir, "${base}_$counter$ext")
+                } else {
+                    File(destDir, "${fileName}_$counter")
+                }
+                counter++
+            }
+            return targetFile
         }
 
         private fun saveRawUpload(
@@ -370,53 +427,52 @@ class PhoneHttpServer(
             destDir: File,
             out: OutputStream
         ) {
-            var targetFile = File(destDir, fileName)
-            var counter = 1
-            while (targetFile.exists()) {
-                val dot = fileName.lastIndexOf('.')
-                targetFile = if (dot != -1) {
-                    val base = fileName.substring(0, dot)
-                    val ext = fileName.substring(dot)
-                    File(destDir, "${base}_$counter$ext")
-                } else {
-                    File(destDir, "${fileName}_$counter")
-                }
-                counter++
-            }
+            val targetFile = uniqueTarget(destDir, fileName)
 
             listener?.onFileTransferStarted(fileName, contentLength, false)
 
-            val outputStream = FileOutputStream(targetFile)
-            val buffer = ByteArray(64 * 1024)
+            val buffer = ByteArray(128 * 1024)
             var totalRead: Long = 0
             var lastReportTime = System.currentTimeMillis()
             var bytesInInterval: Long = 0
 
             try {
-                while (totalRead < contentLength) {
-                    val toRead = Math.min(buffer.size.toLong(), contentLength - totalRead).toInt()
-                    val read = input.read(buffer, 0, toRead)
-                    if (read == -1) break
-                    outputStream.write(buffer, 0, read)
-                    totalRead += read
-                    bytesInInterval += read
+                FileOutputStream(targetFile).use { outputStream ->
+                    while (contentLength <= 0 || totalRead < contentLength) {
+                        val toRead = if (contentLength > 0) {
+                            Math.min(buffer.size.toLong(), contentLength - totalRead).toInt()
+                        } else buffer.size
+                        val read = input.read(buffer, 0, toRead)
+                        if (read == -1) break
+                        outputStream.write(buffer, 0, read)
+                        totalRead += read
+                        bytesInInterval += read
 
-                    val now = System.currentTimeMillis()
-                    val elapsed = now - lastReportTime
-                    if (elapsed >= 300 || totalRead == contentLength) {
-                        val speed = if (elapsed > 0) (bytesInInterval * 1000 / elapsed) else 0L
-                        listener?.onFileTransferProgress(totalRead, contentLength, speed)
-                        lastReportTime = now
-                        bytesInInterval = 0
+                        val now = System.currentTimeMillis()
+                        val elapsed = now - lastReportTime
+                        if (elapsed >= 250) {
+                            val speed = if (elapsed > 0) (bytesInInterval * 1000 / elapsed) else 0L
+                            listener?.onFileTransferProgress(totalRead, contentLength.coerceAtLeast(totalRead), speed)
+                            lastReportTime = now
+                            bytesInInterval = 0
+                        }
                     }
+                    outputStream.flush()
                 }
-                outputStream.flush()
-                outputStream.close()
+
+                if (totalRead <= 0) {
+                    targetFile.delete()
+                    listener?.onFileTransferFailed(fileName, "未收到任何数据")
+                    sendResponse(out, 500, "application/json", "{\"status\":\"error\",\"message\":\"empty body\"}")
+                    return
+                }
+
+                listener?.onFileTransferProgress(totalRead, totalRead, 0L)
 
                 val item = FileItem(
                     id = System.currentTimeMillis().toString(),
                     name = targetFile.name,
-                    size = totalRead,
+                    size = targetFile.length(),
                     filePath = targetFile.absolutePath,
                     timestamp = System.currentTimeMillis(),
                     isIncoming = true
@@ -427,93 +483,140 @@ class PhoneHttpServer(
                 resp.put("status", "ok")
                 resp.put("file_name", targetFile.name)
                 resp.put("save_path", targetFile.absolutePath)
-                resp.put("size", totalRead)
+                resp.put("size", targetFile.length())
                 sendResponse(out, 200, "application/json; charset=utf-8", resp.toString())
             } catch (e: Exception) {
-                outputStream.close()
+                try { targetFile.delete() } catch (_: Exception) {}
                 listener?.onFileTransferFailed(fileName, e.localizedMessage ?: "写入文件失败")
-                sendResponse(out, 500, "application/json", "{\"status\":\"error\",\"message\":\"${e.message}\"}")
+                sendResponse(out, 500, "application/json", "{\"status\":\"error\",\"message\":\"write failed\"}")
             }
         }
 
+        /**
+         * 流式 multipart 解析：只保留尾部 delimiter 长度-1 的字节用于跨块匹配，
+         * 命中 `\r\n--boundary` 即认为文件数据结束，绝不会把 boundary 写进文件。
+         */
         private fun saveMultipartUpload(
             input: InputStream,
             boundary: String,
             contentLength: Long,
             destDir: File,
+            fallbackName: String,
             out: OutputStream
         ) {
-            // 解析 multipart 常见格式
-            val boundaryBytes = "--$boundary".toByteArray(Charsets.ISO_8859_1)
-            var fileName = "upload_${System.currentTimeMillis()}"
+            var fileName = fallbackName
 
-            // 读头部找到 filename
-            val lineBuf = ByteArrayOutputStream()
-            var prev = -1
-            var b: Int
-
-            while (input.read().also { b = it } != -1) {
-                if (prev == '\r'.code && b == '\n'.code) {
-                    val line = String(lineBuf.toByteArray(), Charsets.UTF_8).trim()
-                    lineBuf.reset()
-                    if (line.isEmpty()) {
-                        break // headers end, body begins
-                    }
-                    if (line.contains("filename=\"")) {
-                        fileName = line.substringAfter("filename=\"").substringBefore("\"")
-                    }
-                } else if (b != '\r'.code) {
-                    lineBuf.write(b)
+            // ---- 1. 读文件 part 的头（直到空行）----
+            val headBuf = ByteArrayOutputStream(2048)
+            var st = 0
+            var c = input.read()
+            while (c != -1) {
+                headBuf.write(c)
+                st = when {
+                    (st == 0 || st == 2) && c == '\r'.code -> st + 1
+                    (st == 1 || st == 3) && c == '\n'.code -> st + 1
+                    c == '\r'.code -> 1
+                    else -> 0
                 }
-                prev = b
+                if (st == 4) break
+                c = input.read()
+            }
+            if (st != 4) {
+                sendResponse(out, 400, "application/json", "{\"status\":\"error\",\"message\":\"bad multipart\"}")
+                return
             }
 
-            var targetFile = File(destDir, fileName)
-            var counter = 1
-            while (targetFile.exists()) {
-                val dot = fileName.lastIndexOf('.')
-                targetFile = if (dot != -1) {
-                    val base = fileName.substring(0, dot)
-                    val ext = fileName.substring(dot)
-                    File(destDir, "${base}_$counter$ext")
-                } else {
-                    File(destDir, "${fileName}_$counter")
+            val headText = String(headBuf.toByteArray(), Charsets.UTF_8)
+            for (line in headText.split("\r\n")) {
+                if (line.contains("filename=\"")) {
+                    fileName = line.substringAfter("filename=\"").substringBefore("\"")
                 }
-                counter++
             }
+            if (fileName.isBlank()) fileName = fallbackName
 
+            val targetFile = uniqueTarget(destDir, fileName)
             listener?.onFileTransferStarted(fileName, contentLength, false)
 
-            val outputStream = FileOutputStream(targetFile)
-            val buffer = ByteArray(64 * 1024)
-            var totalRead: Long = 0
+            val delimiter = "\r\n--$boundary".toByteArray(Charsets.ISO_8859_1)
+            val keep = delimiter.size - 1
+            var tail = ByteArray(0)
+            val buffer = ByteArray(128 * 1024)
+
+            var totalWritten: Long = 0
+            var totalConsumed: Long = 0
             var lastReportTime = System.currentTimeMillis()
             var bytesInInterval: Long = 0
+            var finished = false
 
             try {
-                var bytesRead: Int
-                while (input.read(buffer).also { bytesRead = it } != -1) {
-                    outputStream.write(buffer, 0, bytesRead)
-                    totalRead += bytesRead
-                    bytesInInterval += bytesRead
+                FileOutputStream(targetFile).use { fos ->
+                    while (!finished) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        totalConsumed += read
 
-                    val now = System.currentTimeMillis()
-                    val elapsed = now - lastReportTime
-                    if (elapsed >= 300) {
-                        val speed = if (elapsed > 0) (bytesInInterval * 1000 / elapsed) else 0L
-                        listener?.onFileTransferProgress(totalRead, contentLength, speed)
-                        lastReportTime = now
-                        bytesInInterval = 0
+                        val data = if (tail.isEmpty()) buffer.copyOf(read) else {
+                            val merged = ByteArray(tail.size + read)
+                            System.arraycopy(tail, 0, merged, 0, tail.size)
+                            System.arraycopy(buffer, 0, merged, tail.size, read)
+                            merged
+                        }
+
+                        val idx = indexOf(data, delimiter)
+                        if (idx >= 0) {
+                            // 命中 delimiter：写 delimiter 之前的所有字节
+                            fos.write(data, 0, idx)
+                            totalWritten += idx
+                            finished = true
+                        } else {
+                            val safe = data.size - keep
+                            if (safe > 0) {
+                                fos.write(data, 0, safe)
+                                totalWritten += safe
+                                bytesInInterval += safe
+                                tail = data.copyOfRange(safe, data.size)
+                            } else {
+                                tail = data
+                            }
+                        }
+
+                        val now = System.currentTimeMillis()
+                        val elapsed = now - lastReportTime
+                        if (elapsed >= 250) {
+                            val speed = if (elapsed > 0) (bytesInInterval * 1000 / elapsed) else 0L
+                            listener?.onFileTransferProgress(totalWritten, contentLength.coerceAtLeast(totalWritten), speed)
+                            lastReportTime = now
+                            bytesInInterval = 0
+                        }
                     }
-                    if (totalRead >= contentLength && contentLength > 0) break
+                    fos.flush()
                 }
-                outputStream.flush()
-                outputStream.close()
+
+                // 把剩余请求体读完，避免对端写超时（Connection: close，丢弃即可）
+                try {
+                    val drain = ByteArray(32 * 1024)
+                    var guard = 0
+                    while (contentLength > 0 && totalConsumed < contentLength && guard < 20000) {
+                        val r = input.read(drain)
+                        if (r == -1) break
+                        totalConsumed += r
+                        guard++
+                    }
+                } catch (_: Exception) {}
+
+                if (totalWritten <= 0) {
+                    targetFile.delete()
+                    listener?.onFileTransferFailed(fileName, "未收到任何数据")
+                    sendResponse(out, 500, "application/json", "{\"status\":\"error\",\"message\":\"empty body\"}")
+                    return
+                }
+
+                listener?.onFileTransferProgress(totalWritten, totalWritten, 0L)
 
                 val item = FileItem(
                     id = System.currentTimeMillis().toString(),
                     name = targetFile.name,
-                    size = totalRead,
+                    size = targetFile.length(),
                     filePath = targetFile.absolutePath,
                     timestamp = System.currentTimeMillis(),
                     isIncoming = true
@@ -524,17 +627,37 @@ class PhoneHttpServer(
                 resp.put("status", "ok")
                 resp.put("file_name", targetFile.name)
                 resp.put("save_path", targetFile.absolutePath)
+                resp.put("size", targetFile.length())
                 sendResponse(out, 200, "application/json; charset=utf-8", resp.toString())
             } catch (e: Exception) {
-                outputStream.close()
+                try { targetFile.delete() } catch (_: Exception) {}
                 listener?.onFileTransferFailed(fileName, e.localizedMessage ?: "保存失败")
-                sendResponse(out, 500, "application/json", "{\"status\":\"error\",\"message\":\"${e.message}\"}")
+                sendResponse(out, 500, "application/json", "{\"status\":\"error\",\"message\":\"save failed\"}")
             }
+        }
+
+        private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
+            if (needle.isEmpty() || haystack.size < needle.size) return -1
+            val limit = haystack.size - needle.size
+            outer@ for (i in 0..limit) {
+                if (haystack[i] != needle[0]) continue
+                for (j in 1 until needle.size) {
+                    if (haystack[i + j] != needle[j]) continue@outer
+                }
+                return i
+            }
+            return -1
         }
 
         private fun sendResponse(out: OutputStream, code: Int, contentType: String, content: String) {
             val bytes = content.toByteArray(Charsets.UTF_8)
-            val statusText = if (code == 200) "OK" else if (code == 404) "Not Found" else "Internal Server Error"
+            val statusText = when (code) {
+                200 -> "OK"
+                400 -> "Bad Request"
+                404 -> "Not Found"
+                500 -> "Internal Server Error"
+                else -> "OK"
+            }
             val header = "HTTP/1.1 $code $statusText\r\n" +
                     "Content-Type: $contentType\r\n" +
                     "Content-Length: ${bytes.size}\r\n" +
@@ -548,7 +671,11 @@ class PhoneHttpServer(
         fun close() {
             try {
                 inputStream?.close()
+            } catch (_: Exception) {}
+            try {
                 outputStream?.close()
+            } catch (_: Exception) {}
+            try {
                 socket.close()
             } catch (_: Exception) {}
             clientHandlers.remove(connId)

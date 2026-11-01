@@ -1,6 +1,10 @@
 package com.crosstransfer.app
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -18,7 +22,9 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class NetworkManager(private val context: Context) {
 
@@ -33,16 +39,22 @@ class NetworkManager(private val context: Context) {
         fun onRequestStoragePermission()
     }
 
+    /**
+     * 关键修复: readTimeout 为 0 时，WiFi 断开/手机休眠造成的"半开连接"永远不会触发 onFailure，
+     * 手机端会一直以为自己还连着。pingInterval 让 OkHttp 主动发送 WebSocket Ping 帧，
+     * 20 秒收不到 Pong 就直接判定连接失效并回调 onFailure -> 触发重连。
+     */
     private var client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS) // infinite for websockets & big downloads
         .writeTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(20, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
     private var pingClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(4, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
@@ -61,51 +73,69 @@ class NetworkManager(private val context: Context) {
     private var lastPin: String = ""
     private var consecutivePingFailures = 0
 
+    /**
+     * 连接代际号。每次新建连接都会自增，所有回调都会校验自己是否属于当前代际，
+     * 避免旧 socket 的 onFailure/onClosed 迟到回调把新连接打死（这正是"刚连上就断"的根因）。
+     */
+    private val connectionEpoch = AtomicInteger(0)
+
+    /** 限制并发传输数量，避免一次性收到几十个文件时线程爆炸导致卡顿 */
+    private val transferSlots = Semaphore(3)
+
+    private var reconnectRunnable: Runnable? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
     var listener: ConnectionListener? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val appPingRunnable = object : Runnable {
         override fun run() {
-            if (isConnected) {
-                if (isPhonePeer) {
-                    Thread {
-                        try {
-                            val pingReq = Request.Builder()
-                                .url("http://$serverHost:$serverPort/api/ping")
-                                .get()
-                                .build()
-                            val resp = pingClient.newCall(pingReq).execute()
-                            val isOk = resp.isSuccessful
-                            resp.close()
-                            if (isOk) {
-                                consecutivePingFailures = 0
-                            } else {
+            // 关键修复: 无论是否处于连接态都要继续排队，否则一旦某次 isConnected=false
+            // 心跳就永久停摆，重连成功后也没有心跳了。
+            try {
+                if (isConnected) {
+                    if (isPhonePeer) {
+                        Thread {
+                            try {
+                                val pingReq = Request.Builder()
+                                    .url("http://$serverHost:$serverPort/api/ping")
+                                    .get()
+                                    .build()
+                                val resp = pingClient.newCall(pingReq).execute()
+                                val isOk = resp.isSuccessful
+                                resp.close()
+                                if (isOk) {
+                                    consecutivePingFailures = 0
+                                } else {
+                                    consecutivePingFailures++
+                                }
+                            } catch (e: Exception) {
                                 consecutivePingFailures++
                             }
-                        } catch (e: Exception) {
-                            consecutivePingFailures++
-                        }
 
-                        // 允许连续失败 3 次再断开，防止局域网偶发波动导致瞬间掉线
-                        if (consecutivePingFailures >= 3) {
-                            if (isConnected && isPhonePeer) {
-                                isConnected = false
-                                if (autoReconnectEnabled) {
-                                    scheduleReconnect("与对端手机通信中断，正在尝试恢复...")
-                                } else {
-                                    mainHandler.post {
-                                        listener?.onDisconnected("与对端手机连接断开")
+                            // 允许连续失败 3 次再断开，防止局域网偶发波动导致瞬间掉线
+                            if (consecutivePingFailures >= 3) {
+                                if (isConnected && isPhonePeer) {
+                                    isConnected = false
+                                    if (autoReconnectEnabled) {
+                                        scheduleReconnect("与对端手机通信中断，正在尝试恢复...")
+                                    } else {
+                                        mainHandler.post {
+                                            listener?.onDisconnected("与对端手机连接断开")
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }.start()
-                } else if (webSocket != null) {
-                    try {
-                        webSocket?.send("ping")
-                    } catch (_: Exception) {}
+                        }.start()
+                    } else if (webSocket != null) {
+                        try {
+                            webSocket?.send("ping")
+                        } catch (_: Exception) {}
+                    }
                 }
-                mainHandler.postDelayed(this, 10000)
+            } catch (_: Exception) {
+            } finally {
+                mainHandler.postDelayed(this, 8000)
             }
         }
     }
@@ -136,15 +166,62 @@ class NetworkManager(private val context: Context) {
         serverHost = host
         serverPort = port
         candidateHosts = if (candidateIps.isNotEmpty()) candidateIps else listOf(host)
+        registerNetworkCallback()
         internalConnect(host, port, pin)
     }
 
+    /**
+     * 监听网络切换（WiFi 断开、切热点、移动网络切换）。
+     * 网络一旦恢复可用就立刻重连，不必等退避计时器。
+     */
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        try {
+            val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (autoReconnectEnabled && !isConnected && serverHost.isNotEmpty()) {
+                        mainHandler.post {
+                            reconnectAttempts = 0
+                            cancelPendingReconnect()
+                            internalConnect(serverHost, serverPort, lastPin)
+                        }
+                    }
+                }
+            }
+            networkCallback = cb
+            cm.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build(),
+                cb
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            cm?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun cancelPendingReconnect() {
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+    }
+
     private fun internalConnect(host: String, port: Int, pin: String) {
-        closeWebSocketInternal()
+        val myEpoch = closeWebSocketInternal()
 
         // 如果端口是手机服务端端口(52021)，优先使用对等安卓互联握手协议
         if (port == 52021) {
-            connectPhonePeer(candidateHosts.ifEmpty { listOf(host) }, port)
+            connectPhonePeer(candidateHosts.ifEmpty { listOf(host) }, port, myEpoch)
             return
         }
 
@@ -153,10 +230,15 @@ class NetworkManager(private val context: Context) {
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
+                if (connectionEpoch.get() != myEpoch) {
+                    try { ws.close(1000, "stale") } catch (_: Exception) {}
+                    return
+                }
                 isConnected = true
                 isPhonePeer = false
                 reconnectAttempts = 0
                 consecutivePingFailures = 0
+                cancelPendingReconnect()
                 mainHandler.removeCallbacks(appPingRunnable)
                 mainHandler.post(appPingRunnable)
                 mainHandler.post {
@@ -246,11 +328,12 @@ class NetworkManager(private val context: Context) {
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                if (connectionEpoch.get() != myEpoch) return
                 isConnected = false
-                mainHandler.removeCallbacks(appPingRunnable)
-                if (autoReconnectEnabled && code != 1000) {
-                    scheduleReconnect("网络连接关闭，正在尝试重连...")
+                if (autoReconnectEnabled) {
+                    scheduleReconnect("连接已关闭，正在重连...")
                 } else {
+                    mainHandler.removeCallbacks(appPingRunnable)
                     mainHandler.post {
                         listener?.onDisconnected(reason.ifEmpty { "连接已关闭" })
                     }
@@ -258,17 +341,19 @@ class NetworkManager(private val context: Context) {
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                if (connectionEpoch.get() != myEpoch) return
                 isConnected = false
-                mainHandler.removeCallbacks(appPingRunnable)
 
                 // 如果尝试连接 52020 失败，且对端可能是手机时，自动回退探测 52021 (手机服务端端口)
                 if (serverPort == 52020) {
                     Thread {
-                        val connectedToPhone = tryProbePhonePeer(candidateHosts.ifEmpty { listOf(host) }, 52021)
-                        if (!connectedToPhone) {
+                        if (connectionEpoch.get() != myEpoch) return@Thread
+                        val connectedToPhone = tryProbePhonePeer(candidateHosts.ifEmpty { listOf(host) }, 52021, myEpoch)
+                        if (!connectedToPhone && connectionEpoch.get() == myEpoch) {
                             if (autoReconnectEnabled) {
                                 scheduleReconnect("连接中断，正在自动恢复...")
                             } else {
+                                mainHandler.removeCallbacks(appPingRunnable)
                                 mainHandler.post {
                                     listener?.onDisconnected("连接失败: ${t.localizedMessage ?: "无法连接到设备"}")
                                 }
@@ -281,6 +366,7 @@ class NetworkManager(private val context: Context) {
                 if (autoReconnectEnabled) {
                     scheduleReconnect("连接中断，正在自动恢复...")
                 } else {
+                    mainHandler.removeCallbacks(appPingRunnable)
                     mainHandler.post {
                         listener?.onDisconnected("连接失败: ${t.localizedMessage ?: "无法连接到电脑"}")
                     }
@@ -289,7 +375,7 @@ class NetworkManager(private val context: Context) {
         })
     }
 
-    private fun tryProbePhonePeer(hosts: List<String>, port: Int): Boolean {
+    private fun tryProbePhonePeer(hosts: List<String>, port: Int, epoch: Int = connectionEpoch.get()): Boolean {
         val quickClient = client.newBuilder()
             .connectTimeout(2500, TimeUnit.MILLISECONDS)
             .readTimeout(3000, TimeUnit.MILLISECONDS)
@@ -311,6 +397,7 @@ class NetworkManager(private val context: Context) {
 
         for (targetHost in hosts) {
             if (targetHost.isBlank() || targetHost == "127.0.0.1") continue
+            if (connectionEpoch.get() != epoch) return false
             try {
                 val req = Request.Builder()
                     .url("http://$targetHost:$port/api/connect_peer")
@@ -320,6 +407,7 @@ class NetworkManager(private val context: Context) {
                 if (resp.isSuccessful) {
                     val respStr = resp.body?.string() ?: "{}"
                     resp.close()
+                    if (connectionEpoch.get() != epoch) return false
                     val respJson = JSONObject(respStr)
                     val peerName = respJson.optString("name", respJson.optString("model", "安卓对端手机"))
                     serverHost = targetHost
@@ -327,6 +415,8 @@ class NetworkManager(private val context: Context) {
                     isConnected = true
                     isPhonePeer = true
                     reconnectAttempts = 0
+                    consecutivePingFailures = 0
+                    cancelPendingReconnect()
                     mainHandler.removeCallbacks(appPingRunnable)
                     mainHandler.post(appPingRunnable)
                     mainHandler.post {
@@ -342,10 +432,10 @@ class NetworkManager(private val context: Context) {
         return false
     }
 
-    private fun connectPhonePeer(hosts: List<String>, port: Int) {
+    private fun connectPhonePeer(hosts: List<String>, port: Int, epoch: Int = connectionEpoch.get()) {
         Thread {
-            val success = tryProbePhonePeer(hosts, port)
-            if (!success) {
+            val success = tryProbePhonePeer(hosts, port, epoch)
+            if (!success && connectionEpoch.get() == epoch) {
                 if (autoReconnectEnabled) {
                     scheduleReconnect("连接对端手机失败，正在尝试重连...")
                 } else {
@@ -360,28 +450,45 @@ class NetworkManager(private val context: Context) {
     private fun scheduleReconnect(notice: String) {
         if (!autoReconnectEnabled || serverHost.isEmpty()) return
         reconnectAttempts++
-        val delayMs = if (reconnectAttempts <= 3) 2000L else if (reconnectAttempts <= 10) 4000L else 8000L
+        // 指数退避并封顶 15 秒，避免长时间断网时疯狂重连烧电
+        val delayMs = when {
+            reconnectAttempts <= 2 -> 1000L
+            reconnectAttempts <= 5 -> 2500L
+            reconnectAttempts <= 10 -> 5000L
+            reconnectAttempts <= 20 -> 10000L
+            else -> 15000L
+        }
         mainHandler.post {
             listener?.onDisconnected("$notice (第${reconnectAttempts}次重试)")
         }
-        mainHandler.postDelayed({
+        cancelPendingReconnect()
+        val r = Runnable {
+            reconnectRunnable = null
             if (autoReconnectEnabled && !isConnected && serverHost.isNotEmpty()) {
                 internalConnect(serverHost, serverPort, lastPin)
             }
-        }, delayMs)
+        }
+        reconnectRunnable = r
+        mainHandler.postDelayed(r, delayMs)
     }
 
-    private fun closeWebSocketInternal() {
+    /** 关闭当前 socket，并推进连接代际号；返回新的代际号。 */
+    private fun closeWebSocketInternal(): Int {
+        val newEpoch = connectionEpoch.incrementAndGet()
         mainHandler.removeCallbacks(appPingRunnable)
-        try {
-            webSocket?.close(1000, null)
-        } catch (_: Exception) {}
+        cancelPendingReconnect()
+        val old = webSocket
         webSocket = null
+        try {
+            old?.close(1000, null)
+        } catch (_: Exception) {}
         isConnected = false
+        return newEpoch
     }
 
     fun disconnect(reason: String = "用户断开") {
         autoReconnectEnabled = false
+        unregisterNetworkCallback()
         closeWebSocketInternal()
         mainHandler.post {
             listener?.onDisconnected(reason)
@@ -390,6 +497,7 @@ class NetworkManager(private val context: Context) {
 
     fun disconnectByUser() {
         autoReconnectEnabled = false
+        unregisterNetworkCallback()
         if (isPhonePeer && serverHost.isNotEmpty()) {
             Thread {
                 try {
@@ -684,7 +792,10 @@ class NetworkManager(private val context: Context) {
         }
 
         Thread {
+            var acquired = false
             try {
+                transferSlots.acquire()
+                acquired = true
                 val fileName = file.name
                 val fileSize = file.length()
 
@@ -766,6 +877,8 @@ class NetworkManager(private val context: Context) {
                 mainHandler.post {
                     listener?.onFileTransferFailed(file.name, e.localizedMessage ?: "未知网络错误")
                 }
+            } finally {
+                if (acquired) transferSlots.release()
             }
         }.start()
     }
@@ -777,7 +890,10 @@ class NetworkManager(private val context: Context) {
         }
 
         Thread {
+            var acquired = false
             try {
+                transferSlots.acquire()
+                acquired = true
                 val fileName = getFileName(uri) ?: "transfer_${System.currentTimeMillis()}"
                 val fileSize = getFileSize(uri)
 
@@ -864,13 +980,18 @@ class NetworkManager(private val context: Context) {
                 mainHandler.post {
                     listener?.onFileTransferFailed("传输失败", e.localizedMessage ?: "未知网络错误")
                 }
+            } finally {
+                if (acquired) transferSlots.release()
             }
         }.start()
     }
 
     private fun downloadFile(url: String, fileName: String, fileSize: Long, targetDirPath: String? = null) {
         Thread {
+            var acquired = false
             try {
+                transferSlots.acquire()
+                acquired = true
                 mainHandler.post {
                     listener?.onFileTransferStarted(fileName, fileSize, false)
                 }
@@ -968,6 +1089,8 @@ class NetworkManager(private val context: Context) {
                 mainHandler.post {
                     listener?.onFileTransferFailed(fileName, e.localizedMessage ?: "下载失败")
                 }
+            } finally {
+                if (acquired) transferSlots.release()
             }
         }.start()
     }

@@ -191,7 +191,7 @@ async function loadServerInfo(overrideIp = null) {
 
         // Update phone status
         if (data.connected_phones > 0) {
-            updateDeviceConnected("Android 手机");
+            updateDeviceConnected("Android 手机", false);
         } else {
             updateDeviceDisconnected();
         }
@@ -601,26 +601,70 @@ async function disconnectDevice() {
 }
 
 let pcWsPingTimer = null;
+let wsReconnectTimer = null;
+let wsReconnectAttempts = 0;
+let wsEverOpened = false;
+let statusPollTimer = null;
+
+// 指数退避：1s,2s,4s,8s 封顶，避免旧版固定 2s 无限重连把主线程和 CPU 打满
+function nextReconnectDelay() {
+    const delays = [1000, 2000, 4000, 8000];
+    const idx = Math.min(wsReconnectAttempts, delays.length - 1);
+    return delays[idx];
+}
+
+function setWsUiState(state) {
+    const dot = document.getElementById('wsStateDot');
+    const label = document.getElementById('wsStateLabel');
+    if (!dot || !label) return;
+    if (state === 'open') {
+        dot.style.background = '#22C55E';
+        label.textContent = '本机服务已连接';
+    } else if (state === 'connecting') {
+        dot.style.background = '#F59E0B';
+        label.textContent = '正在连接本机服务...';
+    } else {
+        dot.style.background = '#EF4444';
+        label.textContent = '本机服务连接中断，正在恢复';
+    }
+}
 
 // Setup WebSocket
 function initWebSocket() {
+    if (wsReconnectTimer) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = null;
+    }
     const loc = window.location;
     const wsProto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProto}//${loc.host}/ws?device=browser`;
 
-    ws = new WebSocket(wsUrl);
+    setWsUiState('connecting');
+
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch (e) {
+        scheduleWsReconnect();
+        return;
+    }
 
     ws.onopen = () => {
         console.log("PC UI WebSocket已连接");
+        wsEverOpened = true;
+        wsReconnectAttempts = 0;
+        setWsUiState('open');
         if (pcWsPingTimer) clearInterval(pcWsPingTimer);
         pcWsPingTimer = setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send("ping");
+                try { ws.send("ping"); } catch (_) {}
             }
-        }, 10000);
+        }, 8000);
+        // 重连成功后立即校准一次真实状态，避免断线期间错过 phone_connected 事件
+        syncStatusOnce();
     };
 
     ws.onmessage = (event) => {
+        if (event.data === 'pong') return;
         try {
             const msg = JSON.parse(event.data);
             if (msg.type === 'phone_connected') {
@@ -654,6 +698,8 @@ function initWebSocket() {
                 showNotification(`📥 收到来自手机的文件: ${msg.file.name}`);
             } else if (msg.type === 'file_sent') {
                 addHistoryItem(msg.file, true);
+            } else if (msg.type === 'transfer_progress') {
+                updateRemoteTransferProgress(msg);
             } else if (msg.type === 'operation_result') {
                 if (msg.message) {
                     showNotification(msg.success ? `✅ ${msg.message}` : `❌ ${msg.message}`);
@@ -667,9 +713,76 @@ function initWebSocket() {
         }
     };
 
-    ws.onclose = () => {
-        setTimeout(initWebSocket, 2000);
+    ws.onerror = () => {
+        // onclose 会紧随其后触发，这里不做额外处理
     };
+
+    ws.onclose = () => {
+        if (pcWsPingTimer) {
+            clearInterval(pcWsPingTimer);
+            pcWsPingTimer = null;
+        }
+        setWsUiState('closed');
+        scheduleWsReconnect();
+    };
+}
+
+function scheduleWsReconnect() {
+    if (wsReconnectTimer) return;
+    const delay = nextReconnectDelay();
+    wsReconnectAttempts++;
+    wsReconnectTimer = setTimeout(() => {
+        wsReconnectTimer = null;
+        initWebSocket();
+    }, delay);
+}
+
+/**
+ * 轮询兜底：WebSocket 是单点，一旦它悄悄失效（例如浏览器标签页被挂起后恢复），
+ * UI 会长期停留在错误的连接状态。这里每 8 秒对账一次真实状态。
+ */
+async function syncStatusOnce() {
+    try {
+        const res = await fetch('/api/status', { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.connected_phones > 0) {
+            if (!isDeviceConnected) {
+                // 轮询恢复时不要自动弹出手机存储窗口，避免打断用户当前操作
+                updateDeviceConnected("Android 手机", false);
+            }
+        } else {
+            if (isDeviceConnected) {
+                updateDeviceDisconnected("手机连接已断开");
+            }
+        }
+    } catch (_) {}
+}
+
+function startStatusPolling() {
+    if (statusPollTimer) return;
+    statusPollTimer = setInterval(syncStatusOnce, 8000);
+}
+
+function updateRemoteTransferProgress(msg) {
+    const card = document.getElementById('progressCard');
+    if (!card) return;
+    if (msg.done) {
+        card.style.display = 'none';
+        return;
+    }
+    const total = msg.total || 0;
+    const sent = msg.sent || 0;
+    const percent = total > 0 ? Math.min(100, Math.round(sent * 100 / total)) : 0;
+    card.style.display = 'block';
+    const titleEl = document.getElementById('txtProgressTitle');
+    if (titleEl) titleEl.textContent = `正在推送到手机: ${msg.name || ''}`;
+    const pctEl = document.getElementById('txtProgressPercent');
+    if (pctEl) pctEl.textContent = percent + '%';
+    const fillEl = document.getElementById('progressBarFill');
+    if (fillEl) fillEl.style.width = percent + '%';
+    const detEl = document.getElementById('txtProgressDetails');
+    if (detEl) detEl.textContent = `${formatBytes(sent)} / ${formatBytes(total)}`;
 }
 
 // Single file upload via XHR with live speed and progress
@@ -738,10 +851,23 @@ function sendSingleFile(file, targetDir = "", progressPrefix = "") {
 async function sendBatchFiles(files, targetDir = "") {
     if (!files || files.length === 0) return;
     const total = files.length;
+    const totalBytes = files.reduce((s, f) => s + (f.size || 0), 0);
+    let doneBytes = 0;
+    const batchStart = Date.now();
+
     for (let i = 0; i < total; i++) {
         const file = files[i];
         const prefix = total > 1 ? `[${i + 1}/${total}] ` : '';
         await sendSingleFile(file, targetDir, prefix);
+        doneBytes += (file.size || 0);
+        // 批量传输总进度：在标题里显示整批的完成度与整体速度
+        if (total > 1) {
+            const elapsed = Math.max(0.001, (Date.now() - batchStart) / 1000);
+            const avgSpeed = doneBytes / elapsed;
+            const pct = totalBytes > 0 ? Math.round(doneBytes * 100 / totalBytes) : Math.round((i + 1) * 100 / total);
+            txtProgressTitle.textContent = `批量发送 ${i + 1}/${total} 个文件 · 总进度 ${pct}%`;
+            txtProgressDetails.textContent = `${formatBytes(doneBytes)} / ${formatBytes(totalBytes)} · 平均 ${formatBytes(avgSpeed)}/s`;
+        }
     }
     progressCard.style.display = 'none';
 
@@ -1463,4 +1589,18 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('DOMContentLoaded', () => {
     loadServerInfo();
     initWebSocket();
+    startStatusPolling();
 });
+
+// 浏览器标签页重新可见时立即对账并确保 WS 活着（避免挂起后状态错乱）
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+            wsReconnectAttempts = 0;
+            initWebSocket();
+        } else {
+            syncStatusOnce();
+        }
+    }
+});
+
