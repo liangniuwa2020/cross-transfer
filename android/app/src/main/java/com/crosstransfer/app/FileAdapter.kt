@@ -34,7 +34,9 @@ class FileAdapter(
         holder.binding.tvFileIcon.text = item.getIcon()
 
         val timeStr = timeFormat.format(Date(item.timestamp))
-        val directionStr = if (item.isIncoming) "来自电脑" else "已发送到电脑"
+        // 不写死"来自电脑/已发送到电脑"：v1.5.1 起支持手机↔手机互传，
+        // 用中性的收发方向描述，避免手机间传输时显示成"来自电脑"造成误解。
+        val directionStr = if (item.isIncoming) "已接收" else "已发送"
         holder.binding.tvFileInfo.text = "${item.getFormattedSize()} • $timeStr • $directionStr"
 
         holder.binding.btnOpenFile.setOnClickListener {

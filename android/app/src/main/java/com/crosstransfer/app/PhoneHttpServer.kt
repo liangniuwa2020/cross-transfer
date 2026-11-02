@@ -365,9 +365,15 @@ class PhoneHttpServer(
             sendResponse(out, 200, "application/json; charset=utf-8", resp.toString())
         }
 
-        private fun handleUpload(headers: Map<String, String>, input: InputStream, out: OutputStream) {
+        private fun handleUpload(headers: Map<String, String>, rawInput: InputStream, out: OutputStream) {
             val contentType = headers["content-type"] ?: ""
-            val contentLength = headers["content-length"]?.toLongOrNull() ?: 0L
+
+            // OkHttp 在拿不到文件大小时会退化成 Transfer-Encoding: chunked，
+            // 此时既没有 Content-Length，body 里还夹着分块长度行。
+            // 必须先还原成裸字节流，否则长度行会被原样写进文件（文件损坏、打不开）。
+            val isChunked = (headers["transfer-encoding"] ?: "").contains("chunked", ignoreCase = true)
+            val input: InputStream = if (isChunked) ChunkedInputStream(rawInput) else rawInput
+            val contentLength = if (isChunked) -1L else (headers["content-length"]?.toLongOrNull() ?: 0L)
 
             val fileName = headers["x-file-name"]?.let {
                 try { URLDecoder.decode(it, "UTF-8") } catch (_: Exception) { it }
@@ -386,12 +392,16 @@ class PhoneHttpServer(
                 File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "CrossTransfer")
             }
 
-            if (!destDir.exists()) {
-                destDir.mkdirs()
-            }
-            if (!destDir.exists() || !destDir.canWrite()) {
-                destDir = File(context.getExternalFilesDir(null), "Received")
-                if (!destDir.exists()) destDir.mkdirs()
+            // Android 11+ 分区存储下 canWrite() 经常误报 true，真正写的时候才抛 EACCES。
+            // 所以这里实写一个探测文件来确认，写不进去就整体退回到应用私有目录，
+            // 否则用户会看到"传输失败"却不知道是权限问题。
+            destDir = ensureWritableDir(destDir)
+
+            // 既没有 Content-Length 也不是 chunked：请求体长度未知且无法界定，直接拒绝，
+            // 否则读取会一直挂到 soTimeout。
+            if (!isChunked && contentLength <= 0) {
+                sendResponse(out, 400, "application/json", "{\"status\":\"error\",\"message\":\"missing content-length\"}")
+                return
             }
 
             // 处理 multipart/form-data 或 raw binary octet-stream
@@ -401,6 +411,34 @@ class PhoneHttpServer(
             } else {
                 saveRawUpload(input, fileName, contentLength, destDir, out)
             }
+        }
+
+        /**
+         * 返回一个确实可写的目录。优先用期望目录，写不进就退回应用私有外部目录。
+         */
+        private fun ensureWritableDir(preferred: File): File {
+            fun probe(dir: File): Boolean {
+                return try {
+                    if (!dir.exists()) dir.mkdirs()
+                    if (!dir.isDirectory) return false
+                    val probeFile = File(dir, ".ct_write_probe")
+                    java.io.FileOutputStream(probeFile).use { it.write(0) }
+                    probeFile.delete()
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+            }
+
+            if (probe(preferred)) return preferred
+
+            val fallback = File(context.getExternalFilesDir(null), "Received")
+            if (probe(fallback)) return fallback
+
+            // 最后兜底：内部私有目录，一定可写
+            val internal = File(context.filesDir, "Received")
+            internal.mkdirs()
+            return internal
         }
 
         private fun uniqueTarget(destDir: File, fileName: String): File {
@@ -452,7 +490,8 @@ class PhoneHttpServer(
                         val elapsed = now - lastReportTime
                         if (elapsed >= 250) {
                             val speed = if (elapsed > 0) (bytesInInterval * 1000 / elapsed) else 0L
-                            listener?.onFileTransferProgress(totalRead, contentLength.coerceAtLeast(totalRead), speed)
+                            // 同 multipart：contentLength 为 -1 时是 chunked，保持 -1 让 UI 走不定进度
+                            listener?.onFileTransferProgress(totalRead, contentLength, speed)
                             lastReportTime = now
                             bytesInInterval = 0
                         }
@@ -526,6 +565,12 @@ class PhoneHttpServer(
                 return
             }
 
+            // 关键：请求体字节计数必须从第一个字节（含 part 头）就开始。
+            // 旧实现只统计"进入数据循环后"读到的字节，永远少算一个 part 头的长度，
+            // 于是收尾时总以为还有数据没读完，在 socket 上死等 60 秒读超时才返回，
+            // 表现为"手机间传文件一直卡着不动 / 传完对端报失败"。
+            var consumed: Long = headBuf.size().toLong()
+
             val headText = String(headBuf.toByteArray(), Charsets.UTF_8)
             for (line in headText.split("\r\n")) {
                 if (line.contains("filename=\"")) {
@@ -543,7 +588,6 @@ class PhoneHttpServer(
             val buffer = ByteArray(128 * 1024)
 
             var totalWritten: Long = 0
-            var totalConsumed: Long = 0
             var lastReportTime = System.currentTimeMillis()
             var bytesInInterval: Long = 0
             var finished = false
@@ -553,7 +597,7 @@ class PhoneHttpServer(
                     while (!finished) {
                         val read = input.read(buffer)
                         if (read == -1) break
-                        totalConsumed += read
+                        consumed += read
 
                         val data = if (tail.isEmpty()) buffer.copyOf(read) else {
                             val merged = ByteArray(tail.size + read)
@@ -584,7 +628,9 @@ class PhoneHttpServer(
                         val elapsed = now - lastReportTime
                         if (elapsed >= 250) {
                             val speed = if (elapsed > 0) (bytesInInterval * 1000 / elapsed) else 0L
-                            listener?.onFileTransferProgress(totalWritten, contentLength.coerceAtLeast(totalWritten), speed)
+                            // contentLength 为 -1 表示 chunked（大小未知），原样传下去让 UI 显示不定进度，
+                            // 不能 coerceAtLeast(totalWritten)，否则进度条会一直显示 100%。
+                            listener?.onFileTransferProgress(totalWritten, contentLength, speed)
                             lastReportTime = now
                             bytesInInterval = 0
                         }
@@ -592,17 +638,22 @@ class PhoneHttpServer(
                     fos.flush()
                 }
 
-                // 把剩余请求体读完，避免对端写超时（Connection: close，丢弃即可）
-                try {
-                    val drain = ByteArray(32 * 1024)
-                    var guard = 0
-                    while (contentLength > 0 && totalConsumed < contentLength && guard < 20000) {
-                        val r = input.read(drain)
-                        if (r == -1) break
-                        totalConsumed += r
-                        guard++
-                    }
-                } catch (_: Exception) {}
+                // 把剩余的请求体字节精确读完（含结尾的 `--boundary--` 与 CRLF）。
+                // 只补读 contentLength - consumed 这么多，多一个字节都不读：
+                // OkHttp 发完 body 后不会半关闭连接（连接要放回池里复用），
+                // 多读一次就会阻塞到 soTimeout，整条传输白白卡住。
+                if (contentLength > consumed) {
+                    try {
+                        val drain = ByteArray(32 * 1024)
+                        var left = contentLength - consumed
+                        while (left > 0) {
+                            val want = Math.min(drain.size.toLong(), left).toInt()
+                            val r = input.read(drain, 0, want)
+                            if (r == -1) break
+                            left -= r
+                        }
+                    } catch (_: Exception) {}
+                }
 
                 if (totalWritten <= 0) {
                     targetFile.delete()
@@ -679,6 +730,91 @@ class PhoneHttpServer(
                 socket.close()
             } catch (_: Exception) {}
             clientHandlers.remove(connId)
+        }
+    }
+
+    /**
+     * 极简 HTTP/1.1 chunked 解码流。
+     *
+     * 对端 OkHttp 在拿不到文件大小时（典型场景：content:// URI 查不到 SIZE 列）
+     * 会自动改用 `Transfer-Encoding: chunked` 发送请求体。此时 body 里夹着
+     * `1a2b\r\n` 这样的分块长度行和结尾的 `0\r\n\r\n`，必须剥掉，
+     * 否则这些字节会被原样写进文件 —— 用户看到的就是"文件收到了但打不开"。
+     */
+    private class ChunkedInputStream(private val src: InputStream) : InputStream() {
+        private var chunkRemaining: Long = 0
+        private var eof = false
+
+        private fun readLine(): String {
+            val sb = StringBuilder()
+            while (true) {
+                val b = src.read()
+                if (b == -1) break
+                if (b == '\n'.code) {
+                    if (sb.isNotEmpty() && sb[sb.length - 1] == '\r') sb.setLength(sb.length - 1)
+                    break
+                }
+                sb.append(b.toChar())
+            }
+            return sb.toString()
+        }
+
+        private fun ensureChunk(): Boolean {
+            if (eof) return false
+            if (chunkRemaining > 0) return true
+            // 上一块结束时后面跟着的 CRLF
+            val sizeLine = readLine()
+            if (sizeLine.isEmpty()) {
+                eof = true
+                return false
+            }
+            val hex = sizeLine.substringBefore(';').trim()
+            val size = try {
+                hex.toLong(16)
+            } catch (_: Exception) {
+                eof = true
+                return false
+            }
+            if (size <= 0) {
+                // 结尾块：把 trailer 行读掉
+                while (true) {
+                    val t = readLine()
+                    if (t.isEmpty()) break
+                }
+                eof = true
+                return false
+            }
+            chunkRemaining = size
+            return true
+        }
+
+        override fun read(): Int {
+            val one = ByteArray(1)
+            val n = read(one, 0, 1)
+            return if (n <= 0) -1 else (one[0].toInt() and 0xff)
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            if (!ensureChunk()) return -1
+            val want = Math.min(len.toLong(), chunkRemaining).toInt()
+            val n = src.read(b, off, want)
+            if (n <= 0) {
+                eof = true
+                return -1
+            }
+            chunkRemaining -= n
+            if (chunkRemaining == 0L) {
+                // 吃掉分块末尾的 CRLF
+                readLine()
+            }
+            return n
+        }
+
+        override fun available(): Int = if (chunkRemaining > 0) chunkRemaining.toInt() else 0
+
+        override fun close() {
+            try { src.close() } catch (_: Exception) {}
         }
     }
 }

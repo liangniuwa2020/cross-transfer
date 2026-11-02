@@ -4,6 +4,77 @@
 
 ---
 
+## 📌 [v1.5.1] - 2026-11-02 09:20
+
+### 1. 修改目的与问题排查
+* 针对用户反馈：“**安卓手机之间传输文件有问题，无法传输**”，专门排查并修复手机↔手机（对等互联）方向的传输链路。
+* **根本原因深度剖析**：
+  1. **【multipart 收尾 drain 字节计数错误 —— 本次"传不动"的头号根因】**：`PhoneHttpServer.kt` 的 `saveMultipartUpload` 在收尾阶段用 `totalConsumed` 判断"请求体还剩多少字节没读"，但 `totalConsumed` **只统计进入数据循环之后读到的字节，从未把 part 头（`--boundary` / `Content-Disposition` / `Content-Type` / 空行，约 129 字节）计入**。于是 `totalConsumed` 永远比真实消耗少一个 head 长度，条件 `totalConsumed < contentLength` 恒成立，代码在 socket 上继续 `input.read()` **死等到 `soTimeout`（60 秒）**才返回响应。发送端 OkHttp 侧表现为"卡住不动"，最终超时报失败 —— 用户看到的就是"手机之间传不了文件"。
+  2. **【该问题是 v1.5.0 引入的回归】**：v1.4.3 的 `saveMultipartUpload` 用 `if (totalRead >= contentLength && contentLength > 0) break` 在 body 读完时自然退出，**根本没有独立的 drain 阶段**，所以不会空等；v1.5.0 重写为 boundary 流式截断时新增的 drain 引入了这个计数 bug。
+  3. **【chunked 请求体未解码】**：OkHttp 在 `content://` URI 查不到 `OpenableColumns.SIZE` 时会自动改用 `Transfer-Encoding: chunked` 发送请求体。旧实现只认 `Content-Length`，把 chunked 的十六进制长度行（如 `1a2b\r\n`）和结尾 `0\r\n\r\n` **原样写进文件**，对端即使收到了也打不开。
+  4. **【`getFileSize` 用 `available()` 猜大小】**：拿不到 `SIZE` 列时旧代码退回 `stream.available()`，而多数 ContentProvider（网盘、相册、文档提供者）的 `available()` 返回的是"当前可无阻塞读取的字节数"，常常只有几 KB 甚至 0，与真实大小无关。这个错误值被当作 `Content-Length` 上报后，OkHttp 按错误长度发送，对端只收到前几 KB —— 表现为"传过去了但文件不完整/打不开"。
+  5. **【`canWrite()` 在分区存储下误报】**：Android 11+ 分区存储下 `File.canWrite()` 经常返回 true，真正写入时才抛 `EACCES`，用户只看到"传输失败"而不知道是权限问题。
+  6. **【大小未知时进度条假死】**：`contentLength` 为 -1（chunked）时，旧代码用 `contentLength.coerceAtLeast(totalWritten)` 兜底，导致进度条**一直显示 100%**；同时 `MainActivity` 在 `totalBytes <= 0` 时算不出百分比，会显示 "0 / 0 MB"。
+  7. **【历史列表方向文案写死"电脑"】**：`FileAdapter` 把方向写死为"来自电脑 / 已发送到电脑"，手机↔手机互传时文案完全错误，误导用户以为传到了电脑。
+
+### 2. 具体修复
+* **【Android 端 · multipart 字节计数修正（核心）】**：
+  * `saveMultipartUpload` 在读 part 头之后、进入数据循环之前新增 `var consumed: Long = headBuf.size().toLong()`，循环内 `consumed += read`，把 part 头长度纳入统计；
+  * 收尾 drain 改为**精确补齐**，只补读 `contentLength - consumed` 这么多，多一个字节都不读：
+    ```kotlin
+    if (contentLength > consumed) {
+        val drain = ByteArray(32 * 1024)
+        var left = contentLength - consumed
+        while (left > 0) {
+            val want = Math.min(drain.size.toLong(), left).toInt()
+            val r = input.read(drain, 0, want)
+            if (r == -1) break
+            left -= r
+        }
+    }
+    ```
+    注释中明确记录原因：OkHttp 发完 body 后**不会半关闭连接**（连接要放回池里复用），多读一次就阻塞到 `soTimeout`。
+* **【Android 端 · chunked 请求体解码】**：
+  * `handleUpload` 签名改为 `handleUpload(headers: Map<String, String>, rawInput: InputStream, out: OutputStream)`；
+  * 新增 `isChunked` 判定，`val input: InputStream = if (isChunked) ChunkedInputStream(rawInput) else rawInput`，`contentLength` 在 chunked 时为 `-1L`；
+  * 新增 `private class ChunkedInputStream(private val src: InputStream) : InputStream()`：`readLine()` 读行、`ensureChunk()` 解析十六进制块长并跳过 trailer、`read(b, off, len)` 按块读并吃掉块尾 CRLF，`available()` 返回剩余块内字节。
+* **【Android 端 · 文件大小获取修正】**：`getFileSize` 改为**拿不到就返回 `-1`**，不再用 `available()` 猜测；`uri.scheme == "file"` 时用 `File.length()` 兜底。返回 -1 会让 OkHttp 自动切到 chunked，由服务端 `ChunkedInputStream` 正确解码，字节一个不差。
+* **【Android 端 · 目标目录可写性真实探测】**：新增 `ensureWritableDir(preferred: File): File`，用真实写探测文件 `.ct_write_probe` 判断（写一个字节再删掉），失败依次回退 `context.getExternalFilesDir(null)/Received` → `context.filesDir/Received`，避免"能创建目录但写不进文件"。
+* **【Android 端 · 长度未知请求直接拒绝】**：`handleUpload` 增加前置判断 `if (!isChunked && contentLength <= 0)` → 返回 400 `missing content-length`，避免在长度未知时读取挂到 `soTimeout`。
+* **【Android 端 · 进度显示修正】**：
+  * `PhoneHttpServer` 两处进度回调不再 `coerceAtLeast(totalWritten)`，`contentLength` 为 -1 时原样传给 UI；
+  * `MainActivity.onFileTransferStarted` / `onFileTransferProgress` 在 `totalBytes <= 0` 时切换为 `progressBar.isIndeterminate = true`、百分比显示 `…`、速度行只显示已传输量，不再出现"永远 0%"或"永远 100%"。
+* **【Android 端 · 历史列表文案】**：`FileAdapter` 方向文案由"来自电脑 / 已发送到电脑"改为中性的"已接收 / 已发送"，适配手机↔手机场景。
+* **【版本与产物】**：`versionCode` 由 `11` 升级至 `12`，`versionName` 由 `"1.5.0"` 升级至 `"1.5.1"`；重新编译生成 `bin/CrossTransfer_v1.5.1.apk`（别名 `bin/CrossTransfer.apk`）。签名沿用同一 debug keystore（SHA-256 `2f637db4…6efcb38`），可直接覆盖安装升级。
+
+### 3. 修改涉及的文件清单
+* `android/app/src/main/java/com/crosstransfer/app/PhoneHttpServer.kt`：multipart `consumed` 计数修正与精确 drain、`handleUpload` 支持 chunked、新增 `ChunkedInputStream`、新增 `ensureWritableDir`、长度未知请求前置拒绝、进度回调不再 `coerceAtLeast`。
+* `android/app/src/main/java/com/crosstransfer/app/NetworkManager.kt`：`getFileSize` 改为未知时返回 -1（不再用 `available()` 猜），`file://` 用 `File.length()` 兜底。
+* `android/app/src/main/java/com/crosstransfer/app/MainActivity.kt`：大小未知时切不定进度条，百分比显示 `…`，速度行只显示已传输量。
+* `android/app/src/main/java/com/crosstransfer/app/FileAdapter.kt`：方向文案改为"已接收 / 已发送"。
+* `android/app/build.gradle`：`versionCode 12`、`versionName "1.5.1"`。
+
+### 4. 本次编译输出产物
+* **Android 安装包**：[`bin/CrossTransfer_v1.5.1.apk`](file:///E:/Antigravity%20ex_project/cross-transfer/bin/CrossTransfer_v1.5.1.apk)（别名：[`bin/CrossTransfer.apk`](file:///E:/Antigravity%20ex_project/cross-transfer/bin/CrossTransfer.apk)，6.6 MB，versionCode 12）
+
+### 5. 联调验证记录
+* **复现（修复前）**：脚本 `.tmp/phone_srv_sim.py` 用 `socket.socketpair()` 模拟 OkHttp 发完 body 后不半关闭连接，`SO_TIMEOUT=3.0`（真实设备为 60s）：
+  * `[v1.5.0 现行] elapsed=3.01s bytes_ok=True EXCEPTION: TimeoutError('timed out')` —— 字节写对了，但每次都要空等到读超时才回响应；
+  * `[修复实现] elapsed=0.00s bytes_ok=True written=102400 drained=0 head_len=129 consumed=102554 content_length=102554` —— 精确算清 129 字节头 + 102400 字节数据 = 102554，drain 为 0，立刻返回。
+* **验证（修复后）**：`.tmp/phone_srv_verify.py` 把修复后的 Kotlin 实现（含 `ChunkedInputStream`、`save_multipart`、`save_raw`）逐行移植到 Python，4 个用例全部通过：
+  ```
+  FILE_DATA size = 102411
+  [PASS] multipart + Content-Length  elapsed=0.00s  bytes_ok=True  written=102411 drained=0 consumed=102565/102565
+  [PASS] multipart + chunked         elapsed=0.00s  bytes_ok=True  written=102411 drained=0 consumed=102565/-1
+  [PASS] raw + Content-Length        elapsed=0.00s  bytes_ok=True  written=102411/102411
+  [PASS] raw + chunked               elapsed=0.00s  bytes_ok=True  written=102411/-1
+  TOTAL: 4/4 passed
+  ```
+  每个用例都校验落盘字节与源文件（102411 字节，含中文 `tail-中文`）**逐字节相同**，且耗时远小于 `SO_TIMEOUT`。
+* **Android 端**：`assembleDebug` 与 `assembleRelease` 均 `BUILD SUCCESSFUL`；`aapt2 dump badging` 确认 `versionCode='12' versionName='1.5.1'`；`apksigner verify --print-certs` 确认签名 SHA-256 与 v1.5.0 一致，支持覆盖升级。
+
+---
+
 ## 📌 [v1.5.0] - 2026-11-02 00:10
 
 ### 1. 修改目的与问题排查

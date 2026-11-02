@@ -1108,23 +1108,39 @@ class NetworkManager(private val context: Context) {
         return name ?: uri.lastPathSegment
     }
 
+    /**
+     * 取文件大小。
+     *
+     * 注意：拿不到时**必须返回 -1**，不能返回 0，也不能用 `available()` 去猜。
+     * `InputStream.available()` 在多数 ContentProvider（尤其是网盘/相册/文档提供者）
+     * 上返回的是"当前可无阻塞读取的字节数"，往往只有几 KB 或直接 0，和真实文件大小无关。
+     * 一旦把这个值当作 Content-Length 上报，OkHttp 就会按错误的长度发送请求体，
+     * 对端只收到前几 KB —— 用户看到的就是"传过去了但文件打不开/不完整"。
+     * 返回 -1 会让 OkHttp 自动改用 `Transfer-Encoding: chunked`，
+     * 服务端由 ChunkedInputStream 正确解码，字节一个不差。
+     */
     private fun getFileSize(uri: Uri): Long {
         var size: Long = -1
         if (uri.scheme == "content") {
-            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                if (cursor.moveToFirst() && sizeIndex >= 0) {
-                    size = cursor.getLong(sizeIndex)
-                }
-            }
-        }
-        if (size <= 0) {
             try {
-                context.contentResolver.openInputStream(uri)?.use { stream ->
-                    size = stream.available().toLong()
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (cursor.moveToFirst() && sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                        val v = cursor.getLong(sizeIndex)
+                        if (v > 0) size = v
+                    }
                 }
             } catch (_: Exception) {}
         }
-        return size
+        if (size <= 0 && uri.scheme == "file") {
+            try {
+                val p = uri.path
+                if (!p.isNullOrEmpty()) {
+                    val f = java.io.File(p)
+                    if (f.exists()) size = f.length()
+                }
+            } catch (_: Exception) {}
+        }
+        return if (size > 0) size else -1L
     }
 }

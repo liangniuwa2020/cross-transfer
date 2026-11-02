@@ -444,21 +444,40 @@ class MainActivity : AppCompatActivity(), NetworkManager.ConnectionListener, Pho
             binding.cardProgress.visibility = View.VISIBLE
             val dirText = if (isUpload) "正在发送" else "正在接收"
             binding.tvTransferFilename.text = "$dirText: $fileName"
-            binding.progressBar.progress = 0
-            binding.tvTransferPercent.text = "0%"
+            // totalBytes <= 0 表示大小未知（chunked 上传），直接切成不定进度条，
+            // 否则用户会看到一个永远停在 0% 的进度条，误以为卡死。
+            if (totalBytes <= 0) {
+                binding.progressBar.isIndeterminate = true
+                binding.tvTransferPercent.text = "…"
+            } else {
+                binding.progressBar.isIndeterminate = false
+                binding.progressBar.progress = 0
+                binding.tvTransferPercent.text = "0%"
+            }
             binding.tvTransferSpeed.text = "正在准备传输..."
         }
     }
 
     override fun onFileTransferProgress(transferredBytes: Long, totalBytes: Long, speedBps: Long) {
         runOnUiThread {
-            val percent = if (totalBytes > 0) ((transferredBytes * 100) / totalBytes).toInt().coerceIn(0, 100) else 0
-            binding.progressBar.progress = percent
-            binding.tvTransferPercent.text = "$percent%"
-
             val speedMb = speedBps.toDouble() / (1024 * 1024)
             val speedStr = if (speedBps > 0) String.format("%.2f MB/s", speedMb) else "-- MB/s"
             val transferredMb = transferredBytes.toDouble() / (1024 * 1024)
+
+            // 文件大小未知（ContentProvider 查不到 SIZE）时，totalBytes 为 -1，
+            // 此时不能算百分比，也不能显示 "0 / 0 MB"，改成不定进度条 + 只显示已传输量。
+            if (totalBytes <= 0) {
+                binding.progressBar.isIndeterminate = true
+                binding.tvTransferPercent.text = "…"
+                binding.tvTransferSpeed.text = String.format("速度: %s • 已传输: %.1f MB", speedStr, transferredMb)
+                return@runOnUiThread
+            }
+
+            binding.progressBar.isIndeterminate = false
+            val percent = ((transferredBytes * 100) / totalBytes).toInt().coerceIn(0, 100)
+            binding.progressBar.progress = percent
+            binding.tvTransferPercent.text = "$percent%"
+
             val totalMb = totalBytes.toDouble() / (1024 * 1024)
 
             // 剩余时间预估：速度有效且还有剩余字节时才算，否则不显示，避免显示无意义的巨大值
